@@ -1,0 +1,14 @@
+[package]
+name = "rola"
+version = "0.1.0"
+edition = "2021"
+description = "A yazi-style keyboard-first Spotify TUI"
+
+[dependencies]
+ratatui = "0.29"
+unicode-width = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde_json = "1"
+sha2 = "0.10"
+base64 = "0.22"
+open = "5.3"
