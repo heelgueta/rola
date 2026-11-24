@@ -46,17 +46,29 @@ Keep the Spotify app open (or any Connect device) so `rola` has somewhere to pla
 | `Enter` | Open container, play track from here, or start a search |
 | `P` | Play the whole selected playlist / album / list |
 | `/` | Fuzzy filter the current column (`Esc` clears) |
-| `s` / `S` | Cycle sort (default, name, artist, length, released, added) / reverse |
+| `s` / `S` | Cycle sort (default, name, artist, length, released, added) / reverse. Remembered per list |
+| `,` | Settings menu |
 | `space` | Play / pause |
 | `n` / `p` | Next / previous |
 | `<` / `>` | Seek -10s / +10s |
 | `+` / `-` | Volume |
-| `v` | Cycle visualizer: ribbons, plasma, spectrum |
 | `R` | Refresh from Spotify |
 | `?` | Help |
 | `q` | Quit |
 
 The first column holds everything: now playing and queue, your library (playlists, albums, artists, liked songs, recently played), discovery (new from your artists, your top tracks and artists), and search (tracks, albums, artists, playlists).
+
+## Settings
+
+Press `,` for the settings menu (also editable in `~/.config/rola/settings.conf`):
+
+- **Rows:** which fields tracks, albums, artists and playlists show (artist, album, year, date added, length, track count, genres, owner), and **numbers** (album track number, playlist position, or off).
+- **Look:** visualizer on/off; accent color from the album cover, a per-track hue, or a fixed blue.
+- **Main menu:** hide any entry (Discover, Charts, Search, ...) or turn off external sources entirely.
+
+## Awards & lists
+
+Under Discover: Grammy Album / Record / Song of the Year and the Mercury Prize, by year, newest first. Open an album winner to browse it on Spotify; press `Enter` or `P` on a song list to play the winners (each matched on Spotify by search). The data is bundled (`data/awards.tsv`) and regenerated with `python3 tools/gen_awards.py` (source: Wikipedia, CC BY-SA). Years are ceremony years.
 
 ## Beyond the API
 
@@ -66,9 +78,21 @@ Spotify's API is stingy, so `rola` fills the gaps itself:
 - **Local history** (`~/.local/share/rola/history.jsonl`): Spotify only exposes your last 50 plays; `rola` logs every track you play through it (after 20s), giving a full history and a **Most played** ranking.
 - **Charts** from [ListenBrainz](https://listenbrainz.org) (public API, no account, nothing about you is sent): trending artists and hot new releases, resolved to Spotify when you open them. These reflect ListenBrainz's own community, so expect them to skew niche.
 
+## Files rola uses
+
+| Path | What |
+| --- | --- |
+| `~/.config/rola/client_id`, `auth.json` | your Spotify Client ID and login token (`auth.json` is owner-only) |
+| `~/.config/rola/settings.conf` | settings |
+| `~/.cache/rola/cache.json` | disk cache |
+| `~/.local/share/rola/history.jsonl` | local listening log |
+| `~/.local/share/rola/state.json` | remembered sort per list |
+
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for how it all fits together.
+
 ## Visuals and terminals
 
-The ribbons are drawn with braille characters and truecolor. Use a truecolor terminal (iTerm2, Ghostty, kitty, WezTerm). Apple's Terminal.app falls back to 256 colors and shows `256c` in the corner.
+The ribbons are drawn with braille characters and truecolor, colored from the album cover. Use a truecolor terminal (iTerm2, Ghostty, kitty, WezTerm). Apple's Terminal.app falls back to 256 colors and shows `256c` in the corner.
 
 ## Spotify API limits
 

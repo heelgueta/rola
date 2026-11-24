@@ -40,6 +40,10 @@ impl Mock {
                     kind: Kind::Track,
                     date: format!("{}", 1994 + (x >> 24) % 30),
                     added: String::new(),
+                    num: t as u32 + 1,
+                    total: 0,
+                    genres: String::new(),
+                    pos: 0,
                     id,
                 }
             })
@@ -72,6 +76,7 @@ impl Mock {
     fn children_vec(&self, it: &Item) -> Vec<Item> {
         let p: Vec<&str> = it.id.splitn(3, ':').collect();
         match p[0] {
+            "award" => crate::awards::items(&it.id),
             "q" => self.search(p[1], p.get(2).copied().unwrap_or("")),
             "top" => match p[1] {
                 "tracks" => self.all_tracks().into_iter().step_by(4).take(25).collect(),
@@ -80,6 +85,7 @@ impl Mock {
             "sec" => match p[1] {
                 "playlists" => Self::playlist_items(PLAYLISTS),
                 "stats" => stats_items(),
+                "awards" => crate::awards::folder_items(),
                 "charts" => charts_items(),
                 "fresh" => self.all_albums().into_iter().rev().take(8).collect(),
                 "toptracks" => top_ranges("tracks"),

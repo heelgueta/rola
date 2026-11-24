@@ -8,15 +8,28 @@ pub enum Kind {
     Track,
 }
 
+/// One row in any column: a track, album, artist, playlist or menu entry.
+///
+/// `id` is a typed key that doubles as the cache key and (for Spotify things) the URI source:
+///   `tr:<id>` track   `al:<id>` album   `ar:<id>` artist   `pl:<id>` playlist
+///   `sec:<name>` menu folder   `hdr:<name>` non-selectable header   `q:<scope>:<query>` search
+///   `top:<tracks|artists>:<range>`   `chart:<kind>:<arg>` (ListenBrainz)   `hist:<log|top>` (local)
+///   `award:<name>` (bundled data)   `xa:<artist>` / `xl:<artist>|<album>` / `xt:<artist>|<title>`
+///   = "external": named things from outside sources, resolved to Spotify by search when opened.
 #[derive(Clone, Debug)]
 pub struct Item {
     pub id: String,
     pub kind: Kind,
     pub name: String,
+    /// Tracks: "Artist · Album". Albums: artist. Playlists: owner. Used for display, filter, sort.
     pub sub: String,
     pub dur_ms: u32,
-    pub date: String,  // release date (YYYY[-MM-DD]) when known
-    pub added: String, // when it was added to your library/playlist, when known
+    pub date: String,   // release date (YYYY[-MM-DD]) when known
+    pub added: String,  // when added to your library/playlist (ISO date), when known
+    pub num: u32,       // track number within its album (0 = unknown)
+    pub total: u32,     // number of tracks in an album/playlist (0 = unknown)
+    pub genres: String, // artists: first genres, comma separated
+    pub pos: u32,       // 1-based position in the list as loaded (before any sorting)
 }
 
 impl Item {
@@ -51,7 +64,19 @@ pub trait Source {
 }
 
 pub fn mk(id: impl Into<String>, kind: Kind, name: &str, sub: &str) -> Item {
-    Item { id: id.into(), kind, name: name.into(), sub: sub.into(), dur_ms: 0, date: String::new(), added: String::new() }
+    Item {
+        id: id.into(),
+        kind,
+        name: name.into(),
+        sub: sub.into(),
+        dur_ms: 0,
+        date: String::new(),
+        added: String::new(),
+        num: 0,
+        total: 0,
+        genres: String::new(),
+        pos: 0,
+    }
 }
 pub fn hdr(n: &str) -> Item {
     mk(format!("hdr:{n}"), Kind::Header, n, "")
@@ -74,6 +99,7 @@ pub fn root_items() -> Vec<Item> {
         sec("stats", "History (local)"),
         hdr("Discover"),
         sec("fresh", "New from your artists"),
+        sec("awards", "Awards & lists"),
         sec("charts", "Charts · ListenBrainz"),
         sec("toptracks", "Your top tracks"),
         sec("topartists", "Your top artists"),

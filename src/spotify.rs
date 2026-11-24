@@ -94,19 +94,29 @@ fn track_item(t: &Value) -> Option<Item> {
         dur_ms: t["duration_ms"].as_u64().unwrap_or(0) as u32,
         date: t["album"]["release_date"].as_str().unwrap_or("").into(),
         added: String::new(),
+        num: t["track_number"].as_u64().unwrap_or(0) as u32,
+        total: 0,
+        genres: String::new(),
+        pos: 0,
     })
 }
 fn album_item(a: &Value) -> Option<Item> {
     let mut it = mk(format!("al:{}", a["id"].as_str()?), Kind::Album, a["name"].as_str()?, &artists_of(a));
     it.date = a["release_date"].as_str().unwrap_or("").into();
+    it.total = a["total_tracks"].as_u64().unwrap_or(0) as u32;
     Some(it)
 }
 fn artist_item(a: &Value) -> Option<Item> {
-    Some(mk(format!("ar:{}", a["id"].as_str()?), Kind::Artist, a["name"].as_str()?, ""))
+    let mut it = mk(format!("ar:{}", a["id"].as_str()?), Kind::Artist, a["name"].as_str()?, "");
+    it.genres = a["genres"].as_array().map(|g| g.iter().filter_map(|x| x.as_str()).take(2).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+    Some(it)
 }
 fn playlist_item(p: &Value) -> Option<Item> {
     let owner = p["owner"]["display_name"].as_str().or(p["owner"]["id"].as_str()).unwrap_or("");
-    Some(mk(format!("pl:{}", p["id"].as_str()?), Kind::Playlist, p["name"].as_str()?, owner))
+    let mut it = mk(format!("pl:{}", p["id"].as_str()?), Kind::Playlist, p["name"].as_str()?, owner);
+    // 2026 API renamed playlist `tracks` to `items`; accept either
+    it.total = p["items"]["total"].as_u64().or(p["tracks"]["total"].as_u64()).unwrap_or(0) as u32;
+    Some(it)
 }
 
 fn with_added(it: Option<Item>, wrapper: &Value) -> Option<Item> {
@@ -174,7 +184,7 @@ fn persist(cache: &Cache) {
             .filter_map(|(k, e)| match &e.load {
                 Load::Ready(v) => Some((
                     k.clone(),
-                    Value::Array(v.iter().map(|i| json!([i.id, kind_code(i.kind), i.name, i.sub, i.dur_ms, i.date, i.added])).collect()),
+                    Value::Array(v.iter().map(|i| json!([i.id, kind_code(i.kind), i.name, i.sub, i.dur_ms, i.date, i.added, i.num, i.total, i.genres])).collect()),
                 )),
                 _ => None,
             })
@@ -207,6 +217,10 @@ fn load_disk() -> HashMap<String, Entry> {
                         dur_ms: r[4].as_u64()? as u32,
                         date: r[5].as_str().unwrap_or("").into(),
                         added: r[6].as_str().unwrap_or("").into(),
+                        num: r[7].as_u64().unwrap_or(0) as u32,
+                        total: r[8].as_u64().unwrap_or(0) as u32,
+                        genres: r[9].as_str().unwrap_or("").into(),
+                        pos: 0,
                     })
                 })
                 .collect();
@@ -267,6 +281,8 @@ impl Source for Live {
         match key {
             "sec:stats" => return Load::Ready(stats_items()),
             "sec:charts" => return Load::Ready(charts_items()),
+            "sec:awards" => return Load::Ready(crate::awards::folder_items()),
+            k if k.starts_with("award:") => return Load::Ready(crate::awards::items(k)),
             "hist:log" => return Load::Ready(crate::history::log_items()),
             "hist:top" => return Load::Ready(crate::history::most_played()),
             _ => {}
@@ -499,9 +515,14 @@ fn fetch(api: &Api, cache: &Cache, key: &str) -> Result<(), String> {
 pub enum PlayReq {
     Context { uri: String, offset: Option<String> },
     Uris(Vec<String>),
+    /// (artist, title) pairs from outside sources (e.g. award lists): matched on Spotify by search, then played.
+    Search(Vec<(String, String)>),
 }
 pub enum Cmd {
     Play(PlayReq),
+    /// Play/pause decided by asking Spotify what it is doing *now*, so a stale UI can't send the
+    /// wrong command (which Spotify rejects as "Restriction violated").
+    Toggle,
     Pause,
     Resume,
     Next,
@@ -510,6 +531,7 @@ pub enum Cmd {
     Volume(u8),
 }
 pub struct PlayState {
+    pub art_url: String,
     pub item: Item,
     pub progress_ms: u64,
     pub playing: bool,
@@ -519,6 +541,7 @@ pub struct PlayState {
 pub enum Event {
     State(Option<PlayState>),
     Error(String),
+    Info(String),
 }
 
 pub struct Player {
@@ -565,6 +588,7 @@ fn run(api: &Api, cmd: &Cmd, device: &mut Option<String>) -> Result<(), String> 
             (Method::PUT, "/me/player/play", vec![], Some(b))
         }
         Cmd::Play(PlayReq::Uris(u)) => (Method::PUT, "/me/player/play", vec![], Some(json!({ "uris": u }))),
+        Cmd::Toggle | Cmd::Play(PlayReq::Search(_)) => unreachable!("handled in exec()"),
         Cmd::Pause => (Method::PUT, "/me/player/pause", vec![], None),
         Cmd::Resume => (Method::PUT, "/me/player/play", vec![], None),
         Cmd::Next => (Method::POST, "/me/player/next", vec![], None),
@@ -587,6 +611,43 @@ fn run(api: &Api, cmd: &Cmd, device: &mut Option<String>) -> Result<(), String> 
     }
 }
 
+/// Spotify rejects pause-while-paused / play-while-playing with 403 "Restriction violated".
+/// For those commands that just means the goal state already holds, so it is not an error.
+fn benign(r: Result<(), String>) -> Result<(), String> {
+    match r {
+        Err(e) if e.contains("Restriction violated") => Ok(()),
+        other => other,
+    }
+}
+
+/// Runs one command; handles the cases that need more than a single request.
+fn exec(api: &Api, cmd: &Cmd, device: &mut Option<String>, tx: &mpsc::Sender<Event>) -> Result<(), String> {
+    match cmd {
+        Cmd::Toggle => {
+            let playing = poll(api)?.map(|s| s.playing).unwrap_or(false);
+            benign(run(api, if playing { &Cmd::Pause } else { &Cmd::Resume }, device))
+        }
+        Cmd::Pause | Cmd::Resume => benign(run(api, cmd, device)),
+        Cmd::Play(PlayReq::Search(list)) => {
+            let _ = tx.send(Event::Info(format!("matching {} tracks on Spotify…", list.len())));
+            let find = |q: String| api.get("/search", &[("q", q), ("type", "track".into()), ("limit", "1".into())]).ok().and_then(|v| v["tracks"]["items"][0]["uri"].as_str().map(String::from));
+            let mut uris = vec![];
+            for (artist, title) in list {
+                if let Some(u) = find(format!("track:{title} artist:{artist}")).or_else(|| find(format!("{title} {artist}"))) {
+                    uris.push(u);
+                }
+                thread::sleep(Duration::from_millis(120)); // stay well inside the dev-mode rate limit
+            }
+            if uris.is_empty() {
+                return Err("none of those tracks were found on Spotify".into());
+            }
+            let _ = tx.send(Event::Info(format!("playing {} of {} (matched on Spotify)", uris.len(), list.len())));
+            run(api, &Cmd::Play(PlayReq::Uris(uris)), device)
+        }
+        _ => run(api, cmd, device),
+    }
+}
+
 fn poll(api: &Api) -> Result<Option<PlayState>, String> {
     let v = api.get("/me/player", &[])?;
     if v.is_null() {
@@ -601,8 +662,15 @@ fn poll(api: &Api) -> Result<Option<PlayState>, String> {
         dur_ms: it["duration_ms"].as_u64().unwrap_or(0) as u32,
         date: String::new(),
         added: String::new(),
+        num: 0,
+        total: 0,
+        genres: String::new(),
+        pos: 0,
     });
+    // smallest cover (64px) is plenty for palette extraction
+    let art_url = it["album"]["images"].as_array().and_then(|a| a.last()).and_then(|i| i["url"].as_str()).unwrap_or("").to_string();
     Ok(Some(PlayState {
+        art_url,
         item,
         progress_ms: v["progress_ms"].as_u64().unwrap_or(0),
         playing: v["is_playing"].as_bool().unwrap_or(false),
@@ -619,7 +687,7 @@ fn worker(api: Api, rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<Event>) {
     loop {
         match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(cmd) => {
-                if let Err(e) = run(&api, &cmd, &mut device) {
+                if let Err(e) = exec(&api, &cmd, &mut device, &tx) {
                     let _ = tx.send(Event::Error(e));
                 }
                 poll_at = Some(Instant::now() + Duration::from_millis(700));

@@ -2,6 +2,9 @@ use ratatui::prelude::*;
 use std::f64::consts::PI;
 use std::sync::OnceLock;
 
+/// Only the ribbons are shown. `plasma` and `spectrum` are kept (parked) so they can be
+/// brought back as a setting; `render()` still dispatches to them.
+#[allow(dead_code)]
 pub const MODES: [&str; 3] = ["ribbons", "plasma", "spectrum"];
 
 pub fn is_truecolor() -> bool {
@@ -73,6 +76,9 @@ pub struct Ctx {
     pub t: f64,
     pub progress: f64,
     pub energy: f64,
+    /// Ribbon gradient runs from hue_a (left) to hue_b (right), in degrees.
+    pub hue_a: f64,
+    pub hue_b: f64,
 }
 
 impl Ctx {
@@ -83,6 +89,9 @@ impl Ctx {
 }
 
 pub fn render(mode: usize, c: &Ctx) -> Vec<Line<'static>> {
+    if c.w == 0 || c.h == 0 {
+        return vec![]; // terminal too small to draw into (and the math below assumes >= 1 cell)
+    }
     match mode % MODES.len() {
         0 => ribbons(c),
         1 => plasma(c),
@@ -98,7 +107,6 @@ fn ribbons(c: &Ctx) -> Vec<Line<'static>> {
     let mut mask = vec![0u8; w * h];
     let mut col: Vec<Option<Color>> = vec![None; w * h];
     const BIT: [[u8; 4]; 2] = [[0, 1, 2, 6], [3, 4, 5, 7]];
-    let hue = base_hue(c.seed);
     let (k1, k2, k3) = (1.0 + c.f(0) * 2.0, 2.0 + c.f(1) * 3.0, 4.0 + c.f(2) * 4.0);
     let (s1, s2, s3) = (0.7 + c.f(3), 0.5 + c.f(4) * 1.2, 1.2 + c.f(5) * 1.5);
     let (p1, p2, p3) = (c.f(6) * 6.28, c.f(7) * 6.28, c.f(0) * 3.0 + c.progress * 8.0);
@@ -118,7 +126,9 @@ fn ribbons(c: &Ctx) -> Vec<Line<'static>> {
                 let amp = c.energy * (0.2 + 0.8 * bell) * 0.46 + 0.02;
                 let y = ((dh as f64 / 2.0 + v * amp * dh as f64).round() as i32).clamp(0, dh as i32 - 1);
                 let (y0, y1) = prev.map_or((y, y), |p| (p.min(y), p.max(y)));
-                let color = hsl(hue + x * 70.0 + ribbon as f64 * 45.0 + e as f64 * 5.0, 0.72, light);
+                // gradient between the two palette hues; second ribbon drifts a little off so they separate
+                let hue = c.hue_a + (c.hue_b - c.hue_a) * x + ribbon as f64 * 25.0 + e as f64 * 4.0;
+                let color = hsl(hue, 0.72, light);
                 for yy in y0..=y1 {
                     let (cx, cy) = (dx / 2, yy as usize / 4);
                     let i = cy * w + cx;

@@ -8,6 +8,9 @@ fn path() -> PathBuf {
 }
 
 pub fn append(it: &Item) {
+    if cfg!(test) {
+        return; // tests (incl. the live ones) must not add to the user's real listening log
+    }
     let p = path();
     if let Some(d) = p.parent() {
         let _ = fs::create_dir_all(d);
