@@ -1,6 +1,7 @@
 mod app;
 mod auth;
 mod backend;
+mod history;
 mod model;
 mod spotify;
 mod ui;

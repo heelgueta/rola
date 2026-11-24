@@ -38,6 +38,8 @@ impl Mock {
                     sub: format!("{artist} · {album}"),
                     dur_ms: 150_000 + (x >> 16) as u32 % 160_000,
                     kind: Kind::Track,
+                    date: format!("{}", 1994 + (x >> 24) % 30),
+                    added: String::new(),
                     id,
                 }
             })
@@ -77,6 +79,8 @@ impl Mock {
             },
             "sec" => match p[1] {
                 "playlists" => Self::playlist_items(PLAYLISTS),
+                "stats" => stats_items(),
+                "charts" => charts_items(),
                 "fresh" => self.all_albums().into_iter().rev().take(8).collect(),
                 "toptracks" => top_ranges("tracks"),
                 "topartists" => top_ranges("artists"),

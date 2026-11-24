@@ -5,6 +5,18 @@ use crate::{
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::HashMap;
 
+pub const SORTS: [&str; 6] = ["default", "name", "artist", "length", "released", "added"];
+
+fn newest_first(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+    match (a.is_empty(), b.is_empty()) {
+        (true, true) => Equal,
+        (true, false) => Greater,
+        (false, true) => Less,
+        _ => b.cmp(a),
+    }
+}
+
 pub struct Column {
     pub item: Item, // the container this column lists
     pub items: Vec<Item>,
@@ -12,6 +24,8 @@ pub struct Column {
     pub filter: String,
     pub loading: bool,
     pub error: Option<String>,
+    pub sort: usize,
+    pub rev: bool,
 }
 
 fn fuzzy(hay: &str, needle: &str) -> bool {
@@ -20,8 +34,16 @@ fn fuzzy(hay: &str, needle: &str) -> bool {
 }
 
 impl Column {
+    pub fn sort_label(&self) -> String {
+        if self.sort == 0 && !self.rev {
+            return String::new();
+        }
+        format!("sort: {} {}", SORTS[self.sort], if self.rev { "↑" } else { "↓" })
+    }
+
     pub fn view(&self) -> Vec<usize> {
-        self.items
+        let mut v: Vec<usize> = self
+            .items
             .iter()
             .enumerate()
             .filter(|(_, i)| {
@@ -32,7 +54,23 @@ impl Column {
                 }
             })
             .map(|(n, _)| n)
-            .collect()
+            .collect();
+        if self.items.iter().any(|i| i.kind == Kind::Header) {
+            return v; // the root menu keeps its fixed layout
+        }
+        let it = |i: usize| &self.items[i];
+        match self.sort {
+            1 => v.sort_by_key(|&i| it(i).name.to_lowercase()),
+            2 => v.sort_by_key(|&i| (it(i).sub.split(" · ").next().unwrap_or("").to_lowercase(), it(i).name.to_lowercase())),
+            3 => v.sort_by_key(|&i| it(i).dur_ms),
+            4 => v.sort_by(|&a, &b| newest_first(&it(a).date, &it(b).date)),
+            5 => v.sort_by(|&a, &b| newest_first(&it(a).added, &it(b).added)),
+            _ => {}
+        }
+        if self.rev {
+            v.reverse();
+        }
+        v
     }
     pub fn selected(&self) -> Option<&Item> {
         self.view().get(self.sel).map(|&i| &self.items[i])
@@ -67,6 +105,7 @@ pub struct App {
     pub help: bool,
     pub toast: Option<(String, f64)>,
     pub live: bool,
+    logged_id: Option<String>,
     history: Vec<Item>, // demo mode only
     queue: Vec<Item>,   // demo mode only
     qi: usize,
@@ -86,12 +125,14 @@ impl App {
             filter: String::new(),
             loading: false,
             error: None,
+            sort: 0,
+            rev: false,
         };
         let live = player.is_some();
         let mut a = App {
             cols: vec![root], preview: vec![], preview_loading: false, preview_error: None, filtering: false, search: None,
             query: String::new(), viz_mode: 0, now: None, playing: false, progress_ms: 0.0, volume: 70,
-            device: String::new(), t: 0.0, energy: 0.15, quit: false, help: false, toast: None, live, history: vec![],
+            device: String::new(), t: 0.0, energy: 0.15, quit: false, help: false, toast: None, live, logged_id: None, history: vec![],
             queue: vec![], qi: 0, pending_g: false, reload_acc: 0.0, src, player, memory: HashMap::new(),
         };
         a.settle(1);
@@ -192,7 +233,7 @@ impl App {
         let sel = self.memory.get(&item.id).copied().unwrap_or(0);
         let (items, loading, error) = split(self.children_of(&item));
         let sel = sel.min(items.len().saturating_sub(1));
-        self.cols.push(Column { item, items, sel, filter: String::new(), loading, error });
+        self.cols.push(Column { item, items, sel, filter: String::new(), loading, error, sort: 0, rev: false });
         self.refresh_preview();
     }
 
@@ -221,6 +262,27 @@ impl App {
         }
     }
 
+    fn cycle_sort(&mut self, reverse: bool) {
+        let id = self.active().selected().map(|i| i.id.clone());
+        let c = self.active_mut();
+        if c.items.iter().any(|i| i.kind == Kind::Header) {
+            return;
+        }
+        if reverse {
+            c.rev = !c.rev;
+        } else {
+            c.sort = (c.sort + 1) % SORTS.len();
+            c.rev = false;
+        }
+        if let Some(id) = id {
+            let v = c.view();
+            if let Some(p) = v.iter().position(|&i| c.items[i].id == id) {
+                c.sel = p;
+            }
+        }
+        self.refresh_preview();
+    }
+
     // ---------- playback ----------
 
     fn note_now(&mut self, it: &Item) {
@@ -242,7 +304,7 @@ impl App {
         if self.live {
             let ctx = col.item.id.starts_with("pl:") || col.item.id.starts_with("al:");
             let req = match (ctx, col.item.uri(), col.filter.is_empty()) {
-                (true, Some(uri), true) => PlayReq::Context { uri, offset: first.uri() },
+                (true, Some(uri), true) if col.sort == 0 && !col.rev => PlayReq::Context { uri, offset: first.uri() },
                 _ => PlayReq::Uris(tracks.iter().take(100).filter_map(|t| t.uri()).collect()),
             };
             self.send(Cmd::Play(req));
@@ -334,6 +396,10 @@ impl App {
             match e {
                 Event::Error(m) => self.toast(m),
                 Event::State(Some(s)) => {
+                    if s.playing && s.progress_ms >= 20_000 && self.logged_id.as_deref() != Some(s.item.id.as_str()) {
+                        crate::history::append(&s.item);
+                        self.logged_id = Some(s.item.id.clone());
+                    }
                     self.now = Some(s.item);
                     self.progress_ms = s.progress_ms as f64;
                     self.playing = s.playing;
@@ -441,6 +507,8 @@ impl App {
                     }
                 }
             }
+            KeyCode::Char('s') => self.cycle_sort(false),
+            KeyCode::Char('S') => self.cycle_sort(true),
             KeyCode::Char('R') => {
                 self.src.invalidate();
                 for c in &mut self.cols {
@@ -461,5 +529,33 @@ impl App {
             KeyCode::Char('?') => self.help = true,
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::Mock;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn sort_cycles_and_keeps_selection() {
+        let mut a = App::new(Box::new(Mock), None);
+        let k = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        for c in ['j', 'l', 'j', 'j', 'l'] {
+            a.on_key(k(c)); // Playlists > Late night
+        }
+        let sel = a.active().selected().unwrap().id.clone();
+        a.on_key(k('s')); // name
+        let names: Vec<String> = a.active().view().iter().map(|&i| a.active().items[i].name.to_lowercase()).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "sorted by name");
+        assert_eq!(a.active().selected().unwrap().id, sel, "selection follows the item");
+        a.on_key(k('S')); // reverse
+        let rev: Vec<String> = a.active().view().iter().map(|&i| a.active().items[i].name.to_lowercase()).collect();
+        sorted.reverse();
+        assert_eq!(rev, sorted, "reversed");
+        assert_eq!(a.active().sort_label(), "sort: name ↑");
     }
 }

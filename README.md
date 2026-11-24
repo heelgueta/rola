@@ -46,6 +46,7 @@ Keep the Spotify app open (or any Connect device) so `rola` has somewhere to pla
 | `Enter` | Open container, play track from here, or start a search |
 | `P` | Play the whole selected playlist / album / list |
 | `/` | Fuzzy filter the current column (`Esc` clears) |
+| `s` / `S` | Cycle sort (default, name, artist, length, released, added) / reverse |
 | `space` | Play / pause |
 | `n` / `p` | Next / previous |
 | `<` / `>` | Seek -10s / +10s |
@@ -56,6 +57,14 @@ Keep the Spotify app open (or any Connect device) so `rola` has somewhere to pla
 | `q` | Quit |
 
 The first column holds everything: now playing and queue, your library (playlists, albums, artists, liked songs, recently played), discovery (new from your artists, your top tracks and artists), and search (tracks, albums, artists, playlists).
+
+## Beyond the API
+
+Spotify's API is stingy, so `rola` fills the gaps itself:
+
+- **Disk cache** (`~/.cache/rola/`): everything you browse is saved, so lists open instantly next time and refresh in the background.
+- **Local history** (`~/.local/share/rola/history.jsonl`): Spotify only exposes your last 50 plays; `rola` logs every track you play through it (after 20s), giving a full history and a **Most played** ranking.
+- **Charts** from [ListenBrainz](https://listenbrainz.org) (public API, no account, nothing about you is sent): trending artists and hot new releases, resolved to Spotify when you open them. These reflect ListenBrainz's own community, so expect them to skew niche.
 
 ## Visuals and terminals
 
@@ -68,8 +77,8 @@ Spotify's development-mode API is restrictive (see their [February 2026 changes]
 - Tracks of playlists you don't own can't be listed; `P` still plays them.
 - Spotify's own algorithmic playlists (Discover Weekly, Daily Mix, ...) are not exposed to the API.
 - No new-releases, categories or artist top-tracks endpoints; there is no audio analysis, so the visualizer is generative rather than beat-synced.
-- Search returns at most 10 results per request.
+- Search and artist-album endpoints return at most 10 results per request, so `rola` pages through them (search shows about 30).
 
 ## Status
 
-Early: `v0.0.1`. It works, but expect rough edges.
+Early: `v0.0.1` is released; `main` has fixes for pause/next/previous (`411`), opening artists (`400`), plus sorting, the cache, local history and charts.

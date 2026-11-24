@@ -31,6 +31,9 @@ impl Api {
             let mut rb = self.http.request(method.clone(), &url).bearer_auth(self.auth.token()?).query(query);
             if let Some(b) = &body {
                 rb = rb.json(b);
+            } else if method != Method::GET {
+                // Spotify's front end answers body-less PUT/POST with 411 unless this is explicit.
+                rb = rb.header(reqwest::header::CONTENT_LENGTH, "0");
             }
             let resp = rb.send().map_err(|e| e.to_string())?;
             let status = resp.status();
@@ -58,6 +61,15 @@ impl Api {
     pub fn get(&self, path: &str, query: &[(&str, String)]) -> Result<Value, String> {
         self.request(Method::GET, path, query, None)
     }
+
+    /// Unauthenticated GET against a public API (no token, no user data sent).
+    fn get_public(&self, url: &str, query: &[(&str, String)]) -> Result<Value, String> {
+        let r = self.http.get(url).query(query).send().map_err(|e| e.to_string())?;
+        if !r.status().is_success() {
+            return Err(format!("{} from {}", r.status().as_u16(), url.split('/').nth(2).unwrap_or(url)));
+        }
+        r.json().map_err(|e| e.to_string())
+    }
 }
 
 // ---------- parsing ----------
@@ -74,10 +86,20 @@ fn track_item(t: &Value) -> Option<Item> {
     let album = t["album"]["name"].as_str().unwrap_or("");
     let artists = artists_of(t);
     let sub = if album.is_empty() { artists } else { format!("{artists} · {album}") };
-    Some(Item { id: format!("tr:{id}"), kind: Kind::Track, name: t["name"].as_str()?.into(), sub, dur_ms: t["duration_ms"].as_u64().unwrap_or(0) as u32 })
+    Some(Item {
+        id: format!("tr:{id}"),
+        kind: Kind::Track,
+        name: t["name"].as_str()?.into(),
+        sub,
+        dur_ms: t["duration_ms"].as_u64().unwrap_or(0) as u32,
+        date: t["album"]["release_date"].as_str().unwrap_or("").into(),
+        added: String::new(),
+    })
 }
 fn album_item(a: &Value) -> Option<Item> {
-    Some(mk(format!("al:{}", a["id"].as_str()?), Kind::Album, a["name"].as_str()?, &artists_of(a)))
+    let mut it = mk(format!("al:{}", a["id"].as_str()?), Kind::Album, a["name"].as_str()?, &artists_of(a));
+    it.date = a["release_date"].as_str().unwrap_or("").into();
+    Some(it)
 }
 fn artist_item(a: &Value) -> Option<Item> {
     Some(mk(format!("ar:{}", a["id"].as_str()?), Kind::Artist, a["name"].as_str()?, ""))
@@ -87,12 +109,20 @@ fn playlist_item(p: &Value) -> Option<Item> {
     Some(mk(format!("pl:{}", p["id"].as_str()?), Kind::Playlist, p["name"].as_str()?, owner))
 }
 
+fn with_added(it: Option<Item>, wrapper: &Value) -> Option<Item> {
+    it.map(|mut i| {
+        i.added = wrapper["added_at"].as_str().unwrap_or("").into();
+        i
+    })
+}
+
 // ---------- cache ----------
 
 struct Entry {
     load: Load,
     at: Instant,
     inflight: bool,
+    stale: bool, // loaded from disk: show it now, refetch in the background
 }
 type Cache = Arc<Mutex<HashMap<String, Entry>>>;
 
@@ -104,8 +134,93 @@ fn clone_load(l: &Load) -> Load {
     }
 }
 
+fn kind_code(k: Kind) -> u8 {
+    match k {
+        Kind::Header => 0,
+        Kind::Section => 1,
+        Kind::Playlist => 2,
+        Kind::Album => 3,
+        Kind::Artist => 4,
+        Kind::Track => 5,
+    }
+}
+fn code_kind(c: u64) -> Kind {
+    match c {
+        1 => Kind::Section,
+        2 => Kind::Playlist,
+        3 => Kind::Album,
+        4 => Kind::Artist,
+        _ => Kind::Track,
+    }
+}
+
+fn cache_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache/rola/cache.json")
+}
+
+fn persistable(key: &str) -> bool {
+    !(key == "sec:queue" || key.starts_with("q:"))
+}
+
+static DISK: Mutex<()> = Mutex::new(());
+
+/// Write every finished list to disk so the next launch opens instantly.
+fn persist(cache: &Cache) {
+    let _g = DISK.lock().unwrap();
+    let map: serde_json::Map<String, Value> = {
+        let c = cache.lock().unwrap();
+        c.iter()
+            .filter(|(k, e)| persistable(k) && !e.inflight)
+            .filter_map(|(k, e)| match &e.load {
+                Load::Ready(v) => Some((
+                    k.clone(),
+                    Value::Array(v.iter().map(|i| json!([i.id, kind_code(i.kind), i.name, i.sub, i.dur_ms, i.date, i.added])).collect()),
+                )),
+                _ => None,
+            })
+            .collect()
+    };
+    let p = cache_path();
+    if let Some(d) = p.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let tmp = p.with_extension("tmp");
+    if std::fs::write(&tmp, Value::Object(map).to_string()).is_ok() {
+        let _ = std::fs::rename(tmp, p);
+    }
+}
+
+fn load_disk() -> HashMap<String, Entry> {
+    let Ok(text) = std::fs::read_to_string(cache_path()) else { return HashMap::new() };
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&text) else { return HashMap::new() };
+    map.into_iter()
+        .filter_map(|(k, v)| {
+            let items: Vec<Item> = v
+                .as_array()?
+                .iter()
+                .filter_map(|r| {
+                    Some(Item {
+                        id: r[0].as_str()?.into(),
+                        kind: code_kind(r[1].as_u64()?),
+                        name: r[2].as_str()?.into(),
+                        sub: r[3].as_str()?.into(),
+                        dur_ms: r[4].as_u64()? as u32,
+                        date: r[5].as_str().unwrap_or("").into(),
+                        added: r[6].as_str().unwrap_or("").into(),
+                    })
+                })
+                .collect();
+            Some((k, Entry { load: Load::Ready(items), at: Instant::now(), inflight: false, stale: true }))
+        })
+        .collect()
+}
+
 fn set(cache: &Cache, key: &str, load: Load, inflight: bool) {
-    cache.lock().unwrap().insert(key.to_string(), Entry { load, at: Instant::now(), inflight });
+    let done = !inflight && matches!(load, Load::Ready(_));
+    cache.lock().unwrap().insert(key.to_string(), Entry { load, at: Instant::now(), inflight, stale: false });
+    if done && persistable(key) {
+        persist(cache);
+    }
 }
 
 pub struct Live {
@@ -115,7 +230,7 @@ pub struct Live {
 
 impl Live {
     pub fn new(api: Api) -> Live {
-        Live { api, cache: Arc::new(Mutex::new(HashMap::new())) }
+        Live { api, cache: Arc::new(Mutex::new(load_disk())) }
     }
 
     fn ttl(key: &str) -> Duration {
@@ -149,6 +264,13 @@ impl Source for Live {
         if key == "sec:topartists" {
             return Load::Ready(top_ranges("artists"));
         }
+        match key {
+            "sec:stats" => return Load::Ready(stats_items()),
+            "sec:charts" => return Load::Ready(charts_items()),
+            "hist:log" => return Load::Ready(crate::history::log_items()),
+            "hist:top" => return Load::Ready(crate::history::most_played()),
+            _ => {}
+        }
         if key.starts_with("sec:search:") || key.starts_with("hdr:") || !(key.contains(':')) {
             return Load::Ready(vec![]);
         }
@@ -157,7 +279,7 @@ impl Source for Live {
             let mut c = self.cache.lock().unwrap();
             match c.get(key) {
                 Some(e) if e.inflight => return clone_load(&e.load),
-                Some(e) if e.at.elapsed() < if matches!(e.load, Load::Failed(_)) { Duration::from_secs(10) } else { Self::ttl(key) } => return clone_load(&e.load),
+                Some(e) if !e.stale && e.at.elapsed() < if matches!(e.load, Load::Failed(_)) { Duration::from_secs(10) } else { Self::ttl(key) } => return clone_load(&e.load),
                 Some(e) => {
                     prev = match &e.load {
                         Load::Ready(v) | Load::Loading(v) => v.clone(),
@@ -167,7 +289,7 @@ impl Source for Live {
                 None => prev = vec![],
             }
             for k in Self::group(key) {
-                c.insert(k, Entry { load: Load::Loading(prev.clone()), at: Instant::now(), inflight: true });
+                c.insert(k, Entry { load: Load::Loading(prev.clone()), at: Instant::now(), inflight: true, stale: false });
             }
         }
         let (api, cache, key) = (self.api.clone(), self.cache.clone(), key.to_string());
@@ -246,8 +368,58 @@ fn fetch(api: &Api, cache: &Cache, key: &str) -> Result<(), String> {
             }
             Ok(())
         }
-        ("sec", "albums") => paged(api, cache, key, "/me/albums", &[], &[], LIST_CAP, 50, &|x| album_item(&x["album"])),
-        ("sec", "liked") => paged(api, cache, key, "/me/tracks", &[], &[], LIKED_CAP, 50, &|x| track_item(&x["track"])),
+        ("chart", r) => {
+            let (kind, arg) = r.split_once(':').unwrap_or(("artists", "week"));
+            let items: Vec<Item> = if kind == "artists" {
+                let v = api.get_public("https://api.listenbrainz.org/1/stats/sitewide/artists", &[("range", arg.to_string()), ("count", "50".into())])?;
+                v["payload"]["artists"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| {
+                                let n = x["artist_name"].as_str()?;
+                                Some(mk(format!("xa:{n}"), Kind::Artist, n, &format!("{} listens", x["listen_count"].as_u64().unwrap_or(0))))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                let v = api.get_public("https://api.listenbrainz.org/1/explore/fresh-releases/", &[("days", arg.to_string()), ("count", "100".into())])?;
+                let mut rel: Vec<Value> = v["payload"]["releases"].as_array().cloned().unwrap_or_default();
+                rel.sort_by_key(|r| std::cmp::Reverse(r["listen_count"].as_u64().unwrap_or(0)));
+                rel.iter()
+                    .take(50)
+                    .filter_map(|r| {
+                        let (a, n) = (r["artist_credit_name"].as_str()?, r["release_name"].as_str()?);
+                        let mut it = mk(format!("xl:{a}|{n}"), Kind::Album, n, a);
+                        it.date = r["release_date"].as_str().unwrap_or("").into();
+                        Some(it)
+                    })
+                    .collect()
+            };
+            set(cache, key, Load::Ready(items), false);
+            Ok(())
+        }
+        // Outside-source items are resolved to Spotify on open.
+        ("xa", name) => {
+            let v = api.get("/search", &[("q", name.to_string()), ("type", "artist".into()), ("limit", "1".into())])?;
+            let id = v["artists"]["items"][0]["id"].as_str().ok_or("not found on Spotify")?.to_string();
+            paged(api, cache, key, &format!("/artists/{id}/albums"), &[("include_groups", "album,single".into())], &[], 100, 10, &album_item)
+        }
+        ("xl", r) => {
+            let (artist, release) = r.split_once('|').unwrap_or(("", r));
+            let find = |q: String| -> Result<Option<String>, String> {
+                let v = api.get("/search", &[("q", q), ("type", "album".into()), ("limit", "1".into())])?;
+                Ok(v["albums"]["items"][0]["id"].as_str().map(String::from))
+            };
+            let id = match find(format!("album:{release} artist:{artist}"))? {
+                Some(id) => id,
+                None => find(format!("{release} {artist}"))?.ok_or("not found on Spotify")?,
+            };
+            paged(api, cache, key, &format!("/albums/{id}/tracks"), &[], &[], 100, 50, &track_item)
+        }
+        ("sec", "albums") => paged(api, cache, key, "/me/albums", &[], &[], LIST_CAP, 50, &|x| with_added(album_item(&x["album"]), x)),
+        ("sec", "liked") => paged(api, cache, key, "/me/tracks", &[], &[], LIKED_CAP, 50, &|x| with_added(track_item(&x["track"]), x)),
         ("sec", "artists") => {
             let mut all = vec![];
             let mut after: Option<String> = None;
@@ -286,11 +458,11 @@ fn fetch(api: &Api, cache: &Cache, key: &str) -> Result<(), String> {
             paged(api, cache, key, &format!("/me/top/{kind}"), &[("time_range", range.to_string())], &[], 50, 50, parse)
         }
         ("pl", id) => {
-            let r = paged(api, cache, key, &format!("/playlists/{id}/items"), &[], &[], 500, 50, &|x| track_item(if x["item"].is_object() { &x["item"] } else { &x["track"] }));
+            let r = paged(api, cache, key, &format!("/playlists/{id}/items"), &[], &[], 500, 50, &|x| with_added(track_item(if x["item"].is_object() { &x["item"] } else { &x["track"] }), x));
             r.map_err(|e| if e.starts_with("403") || e.starts_with("404") { format!("Spotify only exposes tracks of playlists you own ({e})") } else { e })
         }
         ("al", id) => paged(api, cache, key, &format!("/albums/{id}/tracks"), &[], &[], 200, 50, &track_item),
-        ("ar", id) => paged(api, cache, key, &format!("/artists/{id}/albums"), &[("include_groups", "album,single".into())], &[], 100, 50, &album_item),
+        ("ar", id) => paged(api, cache, key, &format!("/artists/{id}/albums"), &[("include_groups", "album,single".into())], &[], 100, 10, &album_item),
         ("q", r) => {
             let mut p = r.splitn(2, ':');
             let (scope, query) = (p.next().unwrap_or("tracks"), p.next().unwrap_or(""));
@@ -427,6 +599,8 @@ fn poll(api: &Api) -> Result<Option<PlayState>, String> {
         name: it["name"].as_str().unwrap_or("(unknown)").into(),
         sub: it["show"]["name"].as_str().unwrap_or("").into(),
         dur_ms: it["duration_ms"].as_u64().unwrap_or(0) as u32,
+        date: String::new(),
+        added: String::new(),
     });
     Ok(Some(PlayState {
         item,
@@ -469,5 +643,63 @@ fn worker(api: Api, rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<Event>) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn live() -> Live {
+        Live::new(Api::new(Arc::new(Auth::new().unwrap())))
+    }
+    fn wait(l: &Live, it: &Item) -> Vec<Item> {
+        for _ in 0..200 {
+            match l.children(it) {
+                Load::Ready(v) => return v,
+                Load::Failed(e) => panic!("{} failed: {e}", it.id),
+                Load::Loading(_) => thread::sleep(Duration::from_millis(100)),
+            }
+        }
+        panic!("{} timed out", it.id);
+    }
+
+    /// Body-less PUT must not 411. Sets volume to its current value, so it is audibly harmless.
+    #[test]
+    #[ignore]
+    fn live_bodyless_put() {
+        let api = Api::new(Arc::new(Auth::new().unwrap()));
+        let v = api.get("/me/player", &[]).unwrap();
+        let vol = v["device"]["volume_percent"].as_u64().expect("no active device") as u8;
+        let mut dev = None;
+        run(&api, &Cmd::Volume(vol), &mut dev).expect("PUT without body failed");
+        println!("PUT /me/player/volume with no body: ok (volume stays {vol}%)");
+    }
+
+    #[test]
+    #[ignore]
+    fn live_artist_and_charts() {
+        let l = live();
+        let artists = wait(&l, &mk("top:artists:long_term", Kind::Section, "x", ""));
+        let a = &artists[0];
+        let albums = wait(&l, a);
+        println!("artist {:?}: {} albums, first: {:?} ({})", a.name, albums.len(), albums[0].name, albums[0].date);
+        assert!(albums.len() > 10, "paging past 10 should work");
+
+        let trending = wait(&l, &mk("chart:artists:week", Kind::Section, "x", ""));
+        println!("trending: {:?}", trending.iter().take(4).map(|i| i.name.clone()).collect::<Vec<_>>());
+        let first = &trending[0];
+        let alb = wait(&l, first);
+        println!("resolved {:?} on Spotify -> {} albums", first.name, alb.len());
+
+        let hot = wait(&l, &mk("chart:new:14", Kind::Section, "x", ""));
+        println!("hot new: {:?}", hot.iter().take(3).map(|i| format!("{} - {}", i.sub, i.name)).collect::<Vec<_>>());
+        for r in hot.iter().take(3) {
+            match l.children(r) {
+                _ => {}
+            }
+        }
+        let tracks = wait(&l, &hot[0]);
+        println!("resolved {:?} -> {} tracks", hot[0].name, tracks.len());
     }
 }

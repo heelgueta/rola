@@ -52,6 +52,15 @@ pub fn draw(f: &mut Frame, app: &App) {
         crumbs.push(Span::styled(c.item.name.clone(), st));
     }
     f.render_widget(Paragraph::new(Line::from(crumbs)), header);
+    if app.cols.len() > 1 {
+        let c = app.active();
+        let total = c.items.len();
+        let shown = c.view().len();
+        let count = if shown == total { format!("{total} items") } else { format!("{shown}/{total}") };
+        let sort = c.sort_label();
+        let text = if sort.is_empty() { count } else { format!("{count} · {sort}") };
+        f.render_widget(Paragraph::new(Line::styled(format!("{text} "), Style::new().fg(soft()))).right_aligned(), header);
+    }
 
     // miller columns: [parent | current | preview]; at the root, [root | preview]
     let n = app.cols.len();
@@ -107,7 +116,7 @@ pub fn draw(f: &mut Frame, app: &App) {
 
 fn col_msg(loading: bool, error: Option<&str>, filtered: bool) -> String {
     if let Some(e) = error {
-        format!("{e}\n\nenter or P plays it as a whole")
+        if e.contains("you own") { format!("{e}\n\nenter or P plays it as a whole") } else { e.to_string() }
     } else if loading {
         "loading…".into()
     } else if filtered {
@@ -174,6 +183,7 @@ fn list(f: &mut Frame, area: Rect, items: &[&Item], sel: Option<usize>, accent: 
             let avail = w.saturating_sub(right.width() + mark.width() + 1);
             // secondary text: artist for albums/tracks, shown only if there is room
             let sec_full = match it.kind {
+                Kind::Album if it.date.len() >= 4 => format!("{} · {}", it.sub, &it.date[..4]),
                 Kind::Album => it.sub.clone(),
                 Kind::Track => it.sub.split(" · ").next().unwrap_or("").to_string(),
                 _ => String::new(),
@@ -278,6 +288,7 @@ fn help(f: &mut Frame, area: Rect, accent: Color) {
         ("gg  G", "top · bottom"),
         ("ctrl-d  ctrl-u", "half page"),
         ("/", "fuzzy filter  (esc clears)"),
+        ("s  S", "cycle sort · reverse"),
         ("space", "play / pause"),
         ("n  p", "next · previous / restart"),
         ("<  >", "seek ∓10s"),
