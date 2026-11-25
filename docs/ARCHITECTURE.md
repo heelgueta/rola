@@ -33,8 +33,10 @@ Connect device is active (e.g. Spotify.app) what to play. It never streams audio
 | `viz.rs` | the ribbon visualizer (+ parked plasma/spectrum), truecolor/256-color handling |
 | `history.rs` | local listening log (full history, most played) |
 | `awards.rs` | bundled award winners (`data/awards.tsv`), turned into `Item`s |
+| `acclaim.rs` | bundled critic scores (`data/acclaim.tsv`): matching albums by normalized artist+title, row cells, the card, the Acclaim lenses and the listener `Profile` |
 | `backend.rs` | the mock source |
 | `tools/gen_awards.py` | regenerates `data/awards.tsv` from Wikipedia |
+| `tools/export_acclaim.py` | exports `data/acclaim.tsv` from a deadwax database |
 
 ## Data flow and caching
 
@@ -54,6 +56,15 @@ Spotify URI (`Item::uri`), and the key for sort/cursor memory. "External" ids (`
 `xt:`) name things from non-Spotify sources (ListenBrainz, award lists) by artist/title; they are
 resolved to Spotify by search only when opened (`fetch` in spotify.rs) or played (`exec` in the
 `Player` worker, with a small delay between searches to respect dev-mode rate limits).
+
+## Acclaim
+
+`acclaim::of(&Item)` scores any album row by matching normalized artist + title (brackets and
+"- Remastered" tails stripped), memoized per item id. It is used by `ui::right_text`, the
+"acclaim" sort (`app::order`) and the card (`i`). Lens ids are `acc:*`; `Live::acclaim` builds the
+personal ones (`next`, `shelf`, `dig`) from `sec:albums`, top artists and local history through the
+normal cache, so they stay `Loading` until those are complete. Ranking is by `lb` (z minus one
+posterior sd). `dig` is seeded by the day plus a counter that `R` bumps (`acclaim::reroll`).
 
 ## Consistency rules (sorting and cursor)
 

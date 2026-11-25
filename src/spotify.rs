@@ -261,6 +261,35 @@ impl Live {
     }
 }
 
+impl Live {
+    /// An Acclaim lens. The personal ones (next up, missing from your shelf, crate dig) look at
+    /// your saved albums and top artists: those are fetched through the normal cache, and the
+    /// lens stays `Loading` (with whatever is known so far) until they are complete.
+    fn acclaim(&self, key: &str) -> Load {
+        let personal = matches!(key, "acc:next" | "acc:shelf" | "acc:dig");
+        if !personal {
+            return Load::Ready(crate::acclaim::lens(key, &crate::acclaim::Profile::default()));
+        }
+        let mut loading = false;
+        let mut take = |id: &str| -> Vec<Item> {
+            match self.children(&mk(id, Kind::Section, "", "")) {
+                Load::Ready(v) => v,
+                Load::Loading(v) => {
+                    loading = true;
+                    v
+                }
+                Load::Failed(_) => vec![],
+            }
+        };
+        let albums = take("sec:albums");
+        let mut artists: Vec<String> = take("top:artists:long_term").into_iter().map(|a| a.name).collect();
+        artists.extend(take("top:artists:medium_term").into_iter().map(|a| a.name));
+        artists.extend(crate::history::load().into_iter().take(500).map(|(_, t)| t.sub.split(" · ").next().unwrap_or("").to_string()));
+        let items = crate::acclaim::lens(key, &crate::acclaim::Profile::build(&albums, &artists));
+        if loading { Load::Loading(items) } else { Load::Ready(items) }
+    }
+}
+
 impl Source for Live {
     fn root(&self) -> Vec<Item> {
         root_items()
@@ -282,6 +311,8 @@ impl Source for Live {
             "sec:stats" => return Load::Ready(stats_items()),
             "sec:charts" => return Load::Ready(charts_items()),
             "sec:awards" => return Load::Ready(crate::awards::folder_items()),
+            "sec:acclaim" => return Load::Ready(crate::acclaim::folder_items()),
+            k if k.starts_with("acc:") => return self.acclaim(k),
             k if k.starts_with("award:") => return Load::Ready(crate::awards::items(k)),
             "hist:log" => return Load::Ready(crate::history::log_items()),
             "hist:top" => return Load::Ready(crate::history::most_played()),
@@ -742,6 +773,23 @@ mod tests {
         let mut dev = None;
         run(&api, &Cmd::Volume(vol), &mut dev).expect("PUT without body failed");
         println!("PUT /me/player/volume with no body: ok (volume stays {vol}%)");
+    }
+
+    /// Personal acclaim lenses against your real library (read-only).
+    #[test]
+    #[ignore]
+    fn live_acclaim() {
+        let l = live();
+        let albums = wait(&l, &mk("sec:albums", Kind::Section, "x", ""));
+        println!("{} saved albums{}", albums.len(), crate::acclaim::Profile::summary(&albums));
+        for k in ["acc:next", "acc:shelf", "acc:dig"] {
+            let v = wait(&l, &mk(k, Kind::Section, "x", ""));
+            println!("\n== {k}: {} items", v.len());
+            for i in v.iter().take(12) {
+                let r = crate::acclaim::of(i).unwrap();
+                println!("  {:<44} {:<26} {} {:+.1}σ lb {:+.1} ({} critics)", i.name, i.sub, i.date, r.z, r.lb, r.n);
+            }
+        }
     }
 
     #[test]

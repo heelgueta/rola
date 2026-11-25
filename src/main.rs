@@ -3,6 +3,7 @@
 //! Startup: build the app (`--demo` = mock data; otherwise load the Client ID, log in via the
 //! browser if there is no saved token, spawn the playback worker), then loop at ~30 fps:
 //! tick state -> draw -> handle one key event.
+mod acclaim;
 mod app;
 mod art;
 mod auth;
@@ -96,6 +97,38 @@ mod tests {
             app.on_key(key(KeyCode::Char('?')));
             term.draw(|f| ui::draw(f, &app)).unwrap();
         }
+    }
+
+    /// Acclaim: lenses render with scores, the card opens, and sorting by acclaim works.
+    #[test]
+    fn acclaim_walkthrough() {
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let mut app = app::App::new(Box::new(backend::Mock), None);
+        for _ in 0..40 {
+            if app.active().selected().map(|i| i.id.as_str()) == Some("sec:acclaim") {
+                break;
+            }
+            app.on_key(key(KeyCode::Char('j')));
+        }
+        assert_eq!(app.active().selected().unwrap().id, "sec:acclaim");
+        app.on_key(key(KeyCode::Char('l')));
+        for _ in 0..3 {
+            app.on_key(key(KeyCode::Char('j')));
+        }
+        app.on_key(key(KeyCode::Char('l'))); // Sure things
+        app.tick(1.0);
+        term.draw(|f| ui::draw(f, &app)).unwrap();
+        let first = dump(&term);
+        println!("{first}\n");
+        assert!(first.contains("σ"), "scores are shown");
+        app.on_key(key(KeyCode::Char('i')));
+        term.draw(|f| ui::draw(f, &app)).unwrap();
+        let card = dump(&term);
+        println!("{card}\n");
+        assert!(card.contains("you are here"));
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Char('s')));
+        term.draw(|f| ui::draw(f, &app)).unwrap();
     }
 
     #[test]

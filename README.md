@@ -70,6 +70,12 @@ Press `,` for the settings menu (also editable in `~/.config/rola/settings.conf`
 
 Under Discover: Grammy Album / Record / Song of the Year and the Mercury Prize, by year, newest first. Open an album winner to browse it on Spotify; press `Enter` or `P` on a song list to play the winners (each matched on Spotify by search). The data is bundled (`data/awards.tsv`) and regenerated with `python3 tools/gen_awards.py` (source: Wikipedia, CC BY-SA). Years are ceremony years.
 
+## Acclaim: what the critics think
+
+`rola` carries a bundled slice of deadwax, a research project that scores albums by fitting a latent model to ~96 critics (Wikipedia ratings boxes, Pitchfork, MusicBrainz users). Any album row it recognizes shows a **z-score** (`+2.6σ` = 2.6 standard deviations above the average album; percentile optional in settings). Press `i` for the card (z, percentile, honors, where it sits among 64k albums); press `s` to sort a list by acclaim.
+
+Under Discover › *Acclaim · deadwax*: *Next up for you*, *Missing from your shelf*, *Crate dig · tonight* (five records from five decades, `R` re-deals), *Sure things*, *Under the radar*, *Split decisions*, and genre and decade browsers. Lists rank by a conservative lower bound (z minus one standard deviation of uncertainty), so they are short and sciencey rather than endless. Coverage is the critics' sample: ~19.5k albums, thin on mainstream pop and non-English music. Data: ratings published on Wikipedia (CC BY-SA), MusicBrainz (CC0) and other critic sources, reduced to one derived score per album; the bundle holds no individual critic's ratings.
+
 ## Beyond the API
 
 Spotify's API is stingy, so `rola` fills the gaps itself:

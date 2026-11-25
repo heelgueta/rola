@@ -153,6 +153,9 @@ pub fn draw(f: &mut Frame, app: &App) {
     if app.help {
         help(f, f.area(), accent);
     }
+    if let Some(it) = &app.card {
+        card(f, f.area(), it, accent);
+    }
     if let Some(cur) = app.menu {
         settings_menu(f, f.area(), &app.settings, cur, accent);
     }
@@ -231,7 +234,19 @@ fn right_text(it: &Item, s: &Settings) -> String {
     match it.kind {
         Kind::Track if s.t_length && it.dur_ms > 0 => fmt_ms(it.dur_ms as f64),
         Kind::Track => String::new(),
-        Kind::Album if s.a_tracks && it.total > 0 => format!("{} tr ›", it.total),
+        Kind::Album => {
+            let mut parts: Vec<String> = vec![];
+            if s.acclaim != crate::acclaim::Show::Off {
+                if let Some(r) = crate::acclaim::of(it) {
+                    parts.push(crate::acclaim::cell(r, s.acclaim));
+                }
+            }
+            if s.a_tracks && it.total > 0 {
+                parts.push(format!("{} tr", it.total));
+            }
+            parts.push("›".into());
+            parts.join("  ")
+        }
         Kind::Playlist if s.p_count && it.total > 0 => format!("{} ›", it.total),
         _ => "›".into(),
     }
@@ -382,7 +397,8 @@ fn help(f: &mut Frame, area: Rect, accent: Color) {
         ("gg  G", "top · bottom"),
         ("ctrl-d  ctrl-u", "half page"),
         ("/", "fuzzy filter  (esc clears)"),
-        ("s  S", "cycle sort · reverse (remembered per list)"),
+        ("s  S", "cycle sort (incl. acclaim) · reverse, remembered per list"),
+        ("i", "critics' card for an album: z-score, percentile, honors"),
         ("space", "play / pause"),
         ("n  p", "next · previous / restart"),
         ("<  >", "seek ∓10s"),
@@ -395,6 +411,27 @@ fn help(f: &mut Frame, area: Rect, accent: Color) {
     f.render_widget(Clear, r);
     let mut lines = vec![Line::styled(" keys", Style::new().fg(accent).bold()), Line::raw("")];
     lines.extend(rows.iter().map(|(k, d)| Line::from(vec![Span::styled(format!(" {k:<18}"), Style::new().fg(accent)), Span::styled(*d, Style::new().fg(bright()))])));
+    f.render_widget(Paragraph::new(lines).block(Block::bordered().border_style(Style::new().fg(faint()))), r);
+}
+
+/// The critics' card (`i`): the deadwax numbers for one album.
+fn card(f: &mut Frame, area: Rect, it: &Item, accent: Color) {
+    let Some(r) = crate::acclaim::of(it) else { return };
+    let text = crate::acclaim::card(r);
+    let r = popup(area, 78, text.len() as u16 + 4);
+    f.render_widget(Clear, r);
+    let mut lines = vec![Line::styled(format!(" {}", text[0]), Style::new().fg(accent).bold())];
+    for (i, l) in text.iter().enumerate().skip(1) {
+        let style = match i {
+            1 => Style::new().fg(soft()),
+            _ if l.starts_with('▁') || l.starts_with('▂') || l.starts_with('▃') || l.starts_with('▄') || l.starts_with('▅') || l.starts_with('▆') || l.starts_with('▇') || l.starts_with('█') => Style::new().fg(accent),
+            _ if l.trim_start().starts_with('▲') => Style::new().fg(accent).bold(),
+            _ if l.starts_with("-4σ") => Style::new().fg(faint()),
+            _ => Style::new().fg(bright()),
+        };
+        lines.push(Line::styled(format!(" {l}"), style));
+    }
+    lines.push(Line::styled(" any key closes · deadwax: latent model over ~96 critics", Style::new().fg(faint())));
     f.render_widget(Paragraph::new(lines).block(Block::bordered().border_style(Style::new().fg(faint()))), r);
 }
 

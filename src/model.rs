@@ -100,6 +100,7 @@ pub fn root_items() -> Vec<Item> {
         hdr("Discover"),
         sec("fresh", "New from your artists"),
         sec("awards", "Awards & lists"),
+        sec("acclaim", "Acclaim · deadwax"),
         sec("charts", "Charts · ListenBrainz"),
         sec("toptracks", "Your top tracks"),
         sec("topartists", "Your top artists"),

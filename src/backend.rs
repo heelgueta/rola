@@ -77,6 +77,10 @@ impl Mock {
         let p: Vec<&str> = it.id.splitn(3, ':').collect();
         match p[0] {
             "award" => crate::awards::items(&it.id),
+            "acc" => {
+                let albums = self.all_albums();
+                crate::acclaim::lens(&it.id, &crate::acclaim::Profile::build(&albums, &[]))
+            }
             "q" => self.search(p[1], p.get(2).copied().unwrap_or("")),
             "top" => match p[1] {
                 "tracks" => self.all_tracks().into_iter().step_by(4).take(25).collect(),
@@ -86,6 +90,7 @@ impl Mock {
                 "playlists" => Self::playlist_items(PLAYLISTS),
                 "stats" => stats_items(),
                 "awards" => crate::awards::folder_items(),
+                "acclaim" => crate::acclaim::folder_items(),
                 "charts" => charts_items(),
                 "fresh" => self.all_albums().into_iter().rev().take(8).collect(),
                 "toptracks" => top_ranges("tracks"),

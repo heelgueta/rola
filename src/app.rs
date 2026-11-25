@@ -19,7 +19,7 @@ use crate::{
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::{cmp::Ordering, collections::HashMap, fs, path::PathBuf};
 
-pub const SORTS: [&str; 6] = ["default", "name", "artist", "length", "released", "added"];
+pub const SORTS: [&str; 7] = ["default", "name", "artist", "length", "released", "added", "acclaim"];
 
 fn newest_first(a: &str, b: &str) -> Ordering {
     match (a.is_empty(), b.is_empty()) {
@@ -40,6 +40,7 @@ pub fn order(items: &[Item], mut idx: Vec<usize>, sort: usize, rev: bool) -> Vec
         3 => idx.sort_by_key(|&i| it(i).dur_ms),
         4 => idx.sort_by(|&a, &b| newest_first(&it(a).date, &it(b).date)),
         5 => idx.sort_by(|&a, &b| newest_first(&it(a).added, &it(b).added)),
+        6 => idx.sort_by_key(|&i| std::cmp::Reverse(crate::acclaim::sort_key(it(i)))), // best first; unknown albums last
         _ => {}
     }
     if rev {
@@ -183,6 +184,8 @@ pub struct App {
     pub energy: f64,
     pub quit: bool,
     pub help: bool,
+    /// The acclaim card (`i`) for this album, when open.
+    pub card: Option<Item>,
     pub toast: Option<(String, f64)>,
     pub live: bool,
     palettes: Palettes,
@@ -217,7 +220,7 @@ impl App {
         let mut a = App {
             cols: vec![root], preview: vec![], preview_loading: false, preview_error: None, filtering: false, search: None,
             query: String::new(), settings, menu: None, now: None, playing: false, progress_ms: 0.0, volume: 70,
-            device: String::new(), art_url: String::new(), t: 0.0, energy: 0.15, quit: false, help: false, toast: None, live,
+            device: String::new(), art_url: String::new(), t: 0.0, energy: 0.15, quit: false, help: false, card: None, toast: None, live,
             palettes: Palettes::default(), prefs: load_prefs(), cursor: HashMap::new(), hold_until: 0.0, logged_id: None,
             history: vec![], queue: vec![], qi: 0, pending_g: false, reload_acc: 0.0, src, player,
         };
@@ -396,6 +399,10 @@ impl App {
             c.rev = !c.rev;
         } else {
             c.sort = (c.sort + 1) % SORTS.len();
+            // "acclaim" only makes sense where some album has a score
+            if SORTS[c.sort] == "acclaim" && !c.items.iter().any(|i| crate::acclaim::of(i).is_some()) {
+                c.sort = (c.sort + 1) % SORTS.len();
+            }
             c.rev = false;
         }
         if let Some(id) = id {
@@ -404,7 +411,11 @@ impl App {
                 c.sel = p; // cursor stays on the same item
             }
         }
-        let (cid, sort, rev, label) = (c.item.id.clone(), c.sort, c.rev, c.sort_label());
+        let mut label = c.sort_label();
+        if SORTS[c.sort] == "acclaim" {
+            label.push_str(&crate::acclaim::Profile::summary(&c.items));
+        }
+        let (cid, sort, rev) = (c.item.id.clone(), c.sort, c.rev);
         self.prefs.insert(cid, (sort, rev));
         save_prefs(&self.prefs);
         self.toast(label);
@@ -638,8 +649,9 @@ impl App {
         if let Some(cur) = self.menu {
             return self.menu_key(k, cur);
         }
-        if self.help {
+        if self.help || self.card.is_some() {
             self.help = false;
+            self.card = None;
             return;
         }
         if let Some(scope) = self.search.clone() {
@@ -715,6 +727,7 @@ impl App {
             KeyCode::Char('S') => self.cycle_sort(true),
             KeyCode::Char('R') => {
                 self.src.invalidate();
+                crate::acclaim::reroll();
                 for c in &mut self.cols {
                     c.loading = true;
                 }
@@ -731,6 +744,11 @@ impl App {
             KeyCode::Char(',') => self.menu = Some(1),
             KeyCode::Char('/') => self.filtering = true,
             KeyCode::Char('?') => self.help = true,
+            KeyCode::Char('i') => match self.active().selected().cloned() {
+                Some(it) if crate::acclaim::of(&it).is_some() => self.card = Some(it),
+                Some(it) if it.kind == Kind::Album => self.toast("the critics' panel has no score for this album"),
+                _ => self.toast("i shows the critics' card for an album"),
+            },
             _ => {}
         }
     }
@@ -794,7 +812,7 @@ mod tests {
     #[test]
     fn hidden_menu_entries_and_empty_headers_disappear() {
         let mut s = Settings::default();
-        for id in ["sec:fresh", "sec:awards", "sec:charts", "sec:toptracks", "sec:topartists"] {
+        for id in ["sec:fresh", "sec:awards", "sec:acclaim", "sec:charts", "sec:toptracks", "sec:topartists"] {
             s.hidden.insert(id.to_string());
         }
         let root = visible_root(&Mock.root(), &s);

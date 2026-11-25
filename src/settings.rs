@@ -38,6 +38,8 @@ pub struct Settings {
     pub a_year: bool,
     pub a_tracks: bool,
     pub a_added: bool,
+    /// Critics' score (deadwax) on album rows: z-score, percentile, both or nothing.
+    pub acclaim: crate::acclaim::Show,
     // artist rows
     pub r_genres: bool,
     // playlist rows
@@ -63,6 +65,7 @@ impl Default for Settings {
             a_artist: true,
             a_year: true,
             a_tracks: false,
+            acclaim: crate::acclaim::Show::Z,
             a_added: false,
             r_genres: false,
             p_owner: false,
@@ -79,7 +82,7 @@ fn path() -> PathBuf {
 
 /// Main-menu entries that can be hidden, with their labels. (Headers disappear on their own
 /// when everything under them is hidden.)
-pub const ROOT_TOGGLES: [(&str, &str); 16] = [
+pub const ROOT_TOGGLES: [(&str, &str); 17] = [
     ("sec:queue", "Now playing · Queue"),
     ("sec:playlists", "Playlists"),
     ("sec:albums", "Albums"),
@@ -89,6 +92,7 @@ pub const ROOT_TOGGLES: [(&str, &str); 16] = [
     ("sec:stats", "History (local)"),
     ("sec:fresh", "New from your artists"),
     ("sec:awards", "Awards & lists"),
+    ("sec:acclaim", "Acclaim · deadwax"),
     ("sec:charts", "Charts · ListenBrainz"),
     ("sec:toptracks", "Your top tracks"),
     ("sec:topartists", "Your top artists"),
@@ -114,6 +118,7 @@ pub enum Row {
     AYear,
     ATracks,
     AAdded,
+    AAcclaim,
     RGenres,
     POwner,
     PCount,
@@ -139,6 +144,7 @@ pub fn rows() -> Vec<Row> {
         AYear,
         ATracks,
         AAdded,
+        AAcclaim,
         Title("Artist rows"),
         RGenres,
         Title("Playlist rows"),
@@ -185,6 +191,16 @@ impl Settings {
             Row::AYear => ("Year".into(), b(self.a_year)),
             Row::ATracks => ("Track count".into(), b(self.a_tracks)),
             Row::AAdded => ("Date added".into(), b(self.a_added)),
+            Row::AAcclaim => (
+                "Critics' score (deadwax)".into(),
+                match self.acclaim {
+                    crate::acclaim::Show::Off => "off",
+                    crate::acclaim::Show::Z => "z-score",
+                    crate::acclaim::Show::Pct => "percentile",
+                    crate::acclaim::Show::Both => "z-score + percentile",
+                }
+                .into(),
+            ),
             Row::RGenres => ("Genres".into(), b(self.r_genres)),
             Row::POwner => ("Owner".into(), b(self.p_owner)),
             Row::PCount => ("Track count".into(), b(self.p_count)),
@@ -216,6 +232,11 @@ impl Settings {
             Row::AYear => self.a_year = !self.a_year,
             Row::ATracks => self.a_tracks = !self.a_tracks,
             Row::AAdded => self.a_added = !self.a_added,
+            Row::AAcclaim => {
+                use crate::acclaim::Show::*;
+                let all = [Z, Pct, Both, Off];
+                self.acclaim = all[cyc(4, all.iter().position(|a| *a == self.acclaim).unwrap_or(0))];
+            }
             Row::RGenres => self.r_genres = !self.r_genres,
             Row::POwner => self.p_owner = !self.p_owner,
             Row::PCount => self.p_count = !self.p_count,
@@ -253,6 +274,10 @@ impl Settings {
                 "album_year" => s.a_year = b,
                 "album_tracks" => s.a_tracks = b,
                 "album_added" => s.a_added = b,
+                "album_acclaim" => {
+                    use crate::acclaim::Show::*;
+                    s.acclaim = match v { "off" => Off, "percentile" => Pct, "both" => Both, _ => Z }
+                }
                 "artist_genres" => s.r_genres = b,
                 "playlist_owner" => s.p_owner = b,
                 "playlist_count" => s.p_count = b,
@@ -273,11 +298,12 @@ impl Settings {
         let hidden = hidden.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",");
         let acc = match self.accent { Accent::Art => "art", Accent::Track => "track", Accent::Fixed => "fixed" };
         let num = match self.numbering { Numbering::Auto => "auto", Numbering::Position => "position", Numbering::Off => "off" };
+        let acclaim = match self.acclaim { crate::acclaim::Show::Off => "off", crate::acclaim::Show::Z => "z", crate::acclaim::Show::Pct => "percentile", crate::acclaim::Show::Both => "both" };
         let text = format!(
             "# rola settings. Edit here or press `,` inside rola.\n\
              viz = {}\naccent = \"{acc}\"          # art | track | fixed\nnumbering = \"{num}\"      # auto | position | off\n\n\
              track_artist = {}\ntrack_album = {}\ntrack_year = {}\ntrack_added = {}\ntrack_length = {}\n\n\
-             album_artist = {}\nalbum_year = {}\nalbum_tracks = {}\nalbum_added = {}\n\n\
+             album_artist = {}\nalbum_year = {}\nalbum_tracks = {}\nalbum_added = {}\nalbum_acclaim = \"{acclaim}\"   # z | percentile | both | off\n\n\
              artist_genres = {}\n\nplaylist_owner = {}\nplaylist_count = {}\n\n\
              external = {}\nhidden = \"{hidden}\"   # comma-separated main-menu ids\n",
             self.viz, self.t_artist, self.t_album, self.t_year, self.t_added, self.t_length, self.a_artist, self.a_year,
