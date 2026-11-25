@@ -7,9 +7,10 @@
 //! The accent's hue comes from the album cover (see art.rs) but its saturation/lightness are
 //! pinned here, so any cover yields readable text/selection (black on accent, accent on dark).
 use crate::{
-    app::App,
-    model::{Item, Kind},
-    settings::{self, Numbering, Row, Settings},
+    app::{App, Card, CardOf},
+    deadwax::Fetch,
+    model::{mk, Item, Kind},
+    settings::{Numbering, Row, Settings},
     viz,
 };
 use ratatui::{
@@ -153,11 +154,11 @@ pub fn draw(f: &mut Frame, app: &App) {
     if app.help {
         help(f, f.area(), accent);
     }
-    if let Some(it) = &app.card {
-        card(f, f.area(), it, accent);
+    if let Some(c) = &app.card {
+        card(f, f.area(), app, c, accent);
     }
     if let Some(cur) = app.menu {
-        settings_menu(f, f.area(), &app.settings, cur, accent);
+        settings_menu(f, f.area(), &app.settings, &app.menu_rows(), cur, accent);
     }
 }
 
@@ -398,13 +399,14 @@ fn help(f: &mut Frame, area: Rect, accent: Color) {
         ("ctrl-d  ctrl-u", "half page"),
         ("/", "fuzzy filter  (esc clears)"),
         ("s  S", "cycle sort (incl. acclaim) · reverse, remembered per list"),
-        ("i", "critics' card for an album: z-score, percentile, honors"),
+        ("i", "card: album/track (critics, honors) · artist career*"),
+        ("I", "card for what is playing now"),
         ("space", "play / pause"),
         ("n  p", "next · previous / restart"),
         ("<  >", "seek ∓10s"),
         ("+  -", "volume"),
         (",", "settings: columns, numbers, menu, colors"),
-        ("R", "refresh from Spotify"),
+        ("R", "refresh from Spotify (and deadwax)"),
         ("q", "quit"),
     ];
     let r = popup(area, 64, rows.len() as u16 + 4);
@@ -414,30 +416,252 @@ fn help(f: &mut Frame, area: Rect, accent: Color) {
     f.render_widget(Paragraph::new(lines).block(Block::bordered().border_style(Style::new().fg(faint()))), r);
 }
 
-/// The critics' card (`i`): the deadwax numbers for one album.
-fn card(f: &mut Frame, area: Rect, it: &Item, accent: Color) {
-    let Some(r) = crate::acclaim::of(it) else { return };
+// ---------- the card (`i` / `I`) ----------
+
+fn heading(t: &str) -> Line<'static> {
+    Line::styled(format!(" {}", t.to_uppercase()), Style::new().fg(faint()).bold())
+}
+fn kv(k: &str, v: String) -> Line<'static> {
+    Line::from(vec![Span::styled(format!("   {k:<15}"), Style::new().fg(soft())), Span::styled(v, Style::new().fg(bright()))])
+}
+fn note(t: &str) -> Line<'static> {
+    Line::styled(format!(" {t}"), Style::new().fg(faint()))
+}
+fn secs(s: Option<u32>) -> String {
+    s.map(|s| format!("{}:{:02}", s / 60, s % 60)).unwrap_or_default()
+}
+fn thousands(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+fn same_track(a: &str, b: &str) -> bool {
+    let (a, b) = (crate::acclaim::norm_title(a), crate::acclaim::norm_title(b));
+    !a.is_empty() && a == b
+}
+
+/// The core block from the bundle-shaped record: score lines and the histogram.
+fn core_lines(r: &crate::acclaim::Rec, accent: Color) -> Vec<Line<'static>> {
     let text = crate::acclaim::card(r);
-    let r = popup(area, 78, text.len() as u16 + 4);
-    f.render_widget(Clear, r);
-    let mut lines = vec![Line::styled(format!(" {}", text[0]), Style::new().fg(accent).bold())];
+    let mut out = vec![Line::styled(format!(" {}", text[0]), Style::new().fg(accent).bold())];
     for (i, l) in text.iter().enumerate().skip(1) {
         let style = match i {
             1 => Style::new().fg(soft()),
-            _ if l.starts_with('▁') || l.starts_with('▂') || l.starts_with('▃') || l.starts_with('▄') || l.starts_with('▅') || l.starts_with('▆') || l.starts_with('▇') || l.starts_with('█') => Style::new().fg(accent),
+            _ if l.starts_with(['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█']) => Style::new().fg(accent),
             _ if l.trim_start().starts_with('▲') => Style::new().fg(accent).bold(),
             _ if l.starts_with("-4σ") => Style::new().fg(faint()),
             _ => Style::new().fg(bright()),
         };
-        lines.push(Line::styled(format!(" {l}"), style));
+        out.push(Line::styled(format!(" {l}"), style));
     }
-    lines.push(Line::styled(" any key closes · deadwax: latent model over ~96 critics", Style::new().fg(faint())));
-    f.render_widget(Paragraph::new(lines).block(Block::bordered().border_style(Style::new().fg(faint()))), r);
+    out
+}
+
+fn album_lines(app: &App, artist: &str, title: &str, track: Option<&str>, accent: Color, w: usize) -> Vec<Line<'static>> {
+    let probe = mk(format!("xl:{artist}|{title}"), Kind::Album, title, artist);
+    let live = app.dw.album(artist, title); // a cache read; `Failed` without side effects when off
+    let detail = match &live {
+        Fetch::Ready(a) => Some(a.clone()),
+        _ => None,
+    };
+    let Some(r) = crate::acclaim::of(&probe).or(detail.as_ref().map(|a| a.rec)) else {
+        let msg = match live {
+            Fetch::Pending => "looking it up in deadwax…",
+            Fetch::Missing => "deadwax has no score for this album",
+            _ => "the critics' panel has no score for this album",
+        };
+        return vec![Line::styled(format!(" {title}"), Style::new().fg(accent).bold()), Line::styled(format!(" {artist}"), Style::new().fg(soft())), Line::raw(""), note(msg)];
+    };
+    let mut v = core_lines(r, accent);
+    let standout_rank = |t: &str| detail.as_ref().and_then(|a| a.standout.iter().position(|s| same_track(&s.title, t)));
+    if let Some(t) = track {
+        let extra = standout_rank(t).map(|i| format!("   · #{} standout on Deezer", i + 1)).unwrap_or_default();
+        v.insert(3, Line::from(vec![Span::styled(format!(" {:<13}", "track"), Style::new().fg(bright())), Span::styled(format!("{t}{extra}"), Style::new().fg(accent))]));
+    }
+    if matches!(live, Fetch::Pending) {
+        v.push(Line::raw(""));
+        v.push(note("fetching critics, honors and crowd from deadwax…"));
+    }
+    let Some(a) = detail else { return v };
+    if !a.panel.is_empty() {
+        v.push(Line::raw(""));
+        v.push(heading(&format!("critics' panel · {}", a.panel.len())));
+        for c in a.panel.iter().take(14) {
+            let name = if c.retro { format!("{} (retro)", c.critic) } else { c.critic.clone() };
+            let raw = c.raw.map(|x| format!("{x:.0}")).unwrap_or_else(|| "–".into());
+            let line = format!("   {:<34} {raw:>4}/100   {:+.2}σ", fit(&name, 34), c.z);
+            v.push(Line::styled(line, Style::new().fg(if c.z >= 0.0 { bright() } else { soft() })));
+        }
+        if a.panel.len() > 14 {
+            v.push(note(&format!("  … and {} more", a.panel.len() - 14)));
+        }
+        if let Some((_, who)) = a.pitchfork.as_ref().filter(|p| !p.1.is_empty()) {
+            v.push(note(&format!("  Pitchfork review by {who}")));
+        }
+    }
+    if !a.acc.is_empty() || !a.awards.is_empty() {
+        v.push(Line::raw(""));
+        v.push(heading("honors"));
+        for (l, rank) in &a.acc {
+            v.push(Line::styled(fit(&format!("   ☰ {l}{}", rank.map(|r| format!(" · #{r}")).unwrap_or_default()), w), Style::new().fg(bright())));
+        }
+        for (aw, y) in &a.awards {
+            v.push(Line::styled(fit(&format!("   ★ {aw}{}", y.map(|y| format!(" · {y}")).unwrap_or_default()), w), Style::new().fg(bright())));
+        }
+    }
+    if let Some(c) = &a.crowd {
+        let mut rows = vec![];
+        if let Some(f) = c.fans {
+            let gap = c.gap.map(|g| {
+                let x = 10f32.powf(g.abs());
+                if g.abs() < 0.05 { "about what its critics' rank predicts".to_string() } else { format!("{x:.1}× {} than its critics' rank predicts", if g > 0.0 { "more" } else { "fewer" }) }
+            });
+            rows.push(kv("Deezer fans", format!("{}{}", thousands(f), gap.map(|g| format!("   {g}")).unwrap_or_default())));
+        }
+        if let Some(m) = c.mb_rating {
+            rows.push(kv("MusicBrainz", format!("{m:.1}/5{}", c.mb_votes.map(|n| format!(" from {n} votes")).unwrap_or_default())));
+        }
+        if let Some(sl) = c.sitelinks {
+            rows.push(kv("Wikipedia", format!("{sl} language editions")));
+        }
+        if !rows.is_empty() {
+            v.push(Line::raw(""));
+            v.push(heading("crowd vs critics"));
+            v.extend(rows);
+        }
+    }
+    if !a.standout.is_empty() {
+        v.push(Line::raw(""));
+        v.push(heading("standout tracks · by Deezer rank"));
+        for t in &a.standout {
+            let hot = track.is_some_and(|x| same_track(x, &t.title));
+            let line = format!("   {}{:>2}. {}   {}", if hot { "▶ " } else { "  " }, t.pos, fit(&t.title, w.saturating_sub(18)), secs(t.secs));
+            v.push(Line::styled(line, if hot { Style::new().fg(accent).bold() } else { Style::new().fg(bright()) }));
+        }
+    }
+    if let Some(t) = track.filter(|_| !a.tracklist.is_empty()) {
+        v.push(Line::raw(""));
+        v.push(heading("tracklist"));
+        for x in &a.tracklist {
+            let hot = same_track(t, &x.title);
+            let line = format!("   {}{:>2}. {}   {}", if hot { "▶ " } else { "  " }, x.pos, fit(&x.title, w.saturating_sub(18)), secs(x.secs));
+            v.push(Line::styled(line, if hot { Style::new().fg(accent).bold() } else { Style::new().fg(soft()) }));
+        }
+    }
+    if !a.neighbours.is_empty() {
+        v.push(Line::raw(""));
+        let era = if r.year > 0 { format!(" · {}, {}–{}", r.genre, r.year.saturating_sub(3), r.year + 3) } else { String::new() };
+        v.push(heading(&format!("similar era{era}")));
+        for p in &a.neighbours {
+            let right = format!("{:+.1}σ p{}", p.z, crate::acclaim::pct_str(p.pct));
+            let left = fit(&format!("   {}  {} — {}", p.year, p.artist, p.title), w.saturating_sub(right.width() + 2));
+            let pad = w.saturating_sub(left.width() + right.width());
+            v.push(Line::from(vec![Span::styled(left, Style::new().fg(bright())), Span::styled(format!("{}{right}", " ".repeat(pad)), Style::new().fg(soft()))]));
+        }
+    }
+    v
+}
+
+/// ▁..█ for a z-score between -1.5σ and +3.5σ.
+fn spark(z: f32) -> char {
+    const B: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    B[(((z + 1.5) / 5.0 * 7.0).round().clamp(0.0, 7.0)) as usize]
+}
+
+fn artist_lines(app: &App, name: &str, accent: Color, w: usize) -> Vec<Line<'static>> {
+    let a = match app.dw.artist(name) {
+        Fetch::Ready(a) => a,
+        other => {
+            let msg = match other {
+                Fetch::Pending => "looking up the career in deadwax…",
+                Fetch::Missing => "deadwax has no scored albums for this artist",
+                _ => "deadwax did not answer",
+            };
+            return vec![Line::styled(format!(" {name}"), Style::new().fg(accent).bold()), Line::raw(""), note(msg)];
+        }
+    };
+    let years = match (a.begin.get(..4), a.end.get(..4)) {
+        (Some(b), Some(e)) => format!("{b}–{e}"),
+        (Some(b), None) => format!("{b}–"),
+        _ => String::new(),
+    };
+    let meta: Vec<String> = [a.country.clone(), a.kind.to_lowercase(), years].into_iter().filter(|x| !x.is_empty()).collect();
+    let z = |x: Option<f32>| x.map(|x| format!("{x:+.2}σ")).unwrap_or_else(|| "–".into());
+    let mut v = vec![Line::styled(format!(" {}", a.name), Style::new().fg(accent).bold()), Line::styled(format!(" {}", meta.join(" · ")), Style::new().fg(soft())), Line::raw("")];
+    v.push(kv("studio albums", format!("{}   mean {} · best {}", a.n_studio, z(a.mean_z), z(a.best_z))));
+    if let Some((t, y)) = &a.peak {
+        v.push(kv("peak", format!("{t} ({y})")));
+    }
+    v.push(kv("debut → latest", format!("{} → {}", z(a.debut_z), z(a.latest_z))));
+    let studio: Vec<&crate::deadwax::ArtistAlbum> = a.albums.iter().filter(|x| x.kind == "studio").collect();
+    if studio.len() >= 2 {
+        v.push(Line::raw(""));
+        v.push(heading("career curve · studio albums, oldest → newest"));
+        let curve: String = studio.iter().map(|x| spark(x.z)).collect();
+        let (y0, y1) = (studio[0].year, studio[studio.len() - 1].year);
+        v.push(Line::from(vec![Span::styled(format!("   {y0} "), Style::new().fg(faint())), Span::styled(curve, Style::new().fg(accent)), Span::styled(format!(" {y1}"), Style::new().fg(faint()))]));
+    }
+    v.push(Line::raw(""));
+    v.push(heading(&format!("discography · {} scored", a.albums.len())));
+    const BAR: usize = 12;
+    for x in &a.albums {
+        let cells = (((x.z + 2.0) / 6.0 * BAR as f32).round().clamp(0.0, BAR as f32)) as usize;
+        let bar = format!("{}{}", "█".repeat(cells), "·".repeat(BAR - cells));
+        let tag = if x.kind != "studio" && !x.kind.is_empty() { format!(" ({})", x.kind) } else { String::new() };
+        let right = format!("{:+.1}σ p{:<5} {:>2} cr", x.z, crate::acclaim::pct_str(x.pct), x.n);
+        let title_w = w.saturating_sub(7 + BAR + 2 + right.width() + 2);
+        let left = format!("   {}  {}", if x.year > 0 { x.year.to_string() } else { "    ".into() }, fit(&format!("{}{tag}", x.title), title_w));
+        let pad = w.saturating_sub(left.width() + BAR + 2 + right.width());
+        v.push(Line::from(vec![
+            Span::styled(left, Style::new().fg(bright())),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(bar, Style::new().fg(if x.lb >= 1.0 { accent } else { soft() })),
+            Span::styled(format!("  {right}"), Style::new().fg(soft())),
+        ]));
+    }
+    v
+}
+
+/// The card overlay: scrollable, fills in as live data arrives.
+fn card(f: &mut Frame, area: Rect, app: &App, c: &Card, accent: Color) {
+    let w = 84u16.min(area.width);
+    let inner_w = w.saturating_sub(3) as usize;
+    let mut lines = match &c.of {
+        CardOf::Album { artist, title, track } => album_lines(app, artist, title, track.as_deref(), accent, inner_w),
+        CardOf::Artist { name } => artist_lines(app, name, accent, inner_w),
+    };
+    lines.push(Line::raw(""));
+    let src = match app.dw.meta().filter(|_| app.dw.on()) {
+        Some(m) => format!("deadwax: latent model over ~96 critics · live, {} scored albums ({})", m.n_albums, m.mode),
+        None => "deadwax: latent model over ~96 critics".to_string(),
+    };
+    lines.push(note(&src));
+    let r = popup(area, w, lines.len() as u16 + 3);
+    f.render_widget(Clear, r);
+    let inner_h = r.height.saturating_sub(3) as usize; // two borders + the footer
+    let max = lines.len().saturating_sub(inner_h);
+    c.max.set(max);
+    let off = c.scroll.min(max);
+    let mut shown: Vec<Line> = lines.into_iter().skip(off).take(inner_h).collect();
+    let more = match (off > 0, off < max) {
+        (true, true) => "  ↑↓",
+        (false, true) => "  ↓ more",
+        (true, false) => "  ↑",
+        _ => "",
+    };
+    let link = if app.card_url().is_some() { "o open in deadwax · " } else { "" };
+    shown.push(Line::styled(format!(" j/k scroll · {link}esc/i close{more}"), Style::new().fg(faint())));
+    f.render_widget(Paragraph::new(shown).block(Block::bordered().border_style(Style::new().fg(faint()))), r);
 }
 
 /// The settings overlay (`,`): one scrolling list built from `settings::rows()`.
-fn settings_menu(f: &mut Frame, area: Rect, s: &Settings, cursor: usize, accent: Color) {
-    let rows = settings::rows();
+fn settings_menu(f: &mut Frame, area: Rect, s: &Settings, rows: &[Row], cursor: usize, accent: Color) {
     let r = popup(area, 72, rows.len() as u16 + 4);
     f.render_widget(Clear, r);
     let inner_h = r.height.saturating_sub(4) as usize; // title + blank + footer + border

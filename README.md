@@ -46,7 +46,9 @@ Keep the Spotify app open (or any Connect device) so `rola` has somewhere to pla
 | `Enter` | Open container, play track from here, or start a search |
 | `P` | Play the whole selected playlist / album / list |
 | `/` | Fuzzy filter the current column (`Esc` clears) |
-| `s` / `S` | Cycle sort (default, name, artist, length, released, added) / reverse. Remembered per list |
+| `s` / `S` | Cycle sort (default, name, artist, length, released, added, acclaim) / reverse. Remembered per list |
+| `i` | Card for the selected album, track (its album) or artist: scroll with `j` `k`, close with `Esc` / `i` |
+| `I` | Card for what is playing now |
 | `,` | Settings menu |
 | `space` | Play / pause |
 | `n` / `p` | Next / previous |
@@ -74,7 +76,19 @@ Under Discover: Grammy Album / Record / Song of the Year and the Mercury Prize, 
 
 `rola` carries a bundled slice of deadwax, a research project that scores albums by fitting a latent model to ~96 critics (Wikipedia ratings boxes, Pitchfork, MusicBrainz users). Any album row it recognizes shows a **z-score** (`+2.6σ` = 2.6 standard deviations above the average album; percentile optional in settings). Press `i` for the card (z, percentile, honors, where it sits among 64k albums); press `s` to sort a list by acclaim.
 
+Press `i` on a track for its album's card, or `I` for whatever is playing.
+
 Under Discover › *Acclaim · deadwax*: *Next up for you*, *Missing from your shelf*, *Crate dig · tonight* (five records from five decades, `R` re-deals), *Sure things*, *Under the radar*, *Split decisions*, and genre and decade browsers. Lists rank by a conservative lower bound (z minus one standard deviation of uncertainty), so they are short and sciencey rather than endless. Coverage is the critics' sample: ~19.5k albums, thin on mainstream pop and non-English music. Data: ratings published on Wikipedia (CC BY-SA), MusicBrainz (CC0) and other critic sources, reduced to one derived score per album; the bundle holds no individual critic's ratings.
+
+### Live deadwax (optional)
+
+If a deadwax server is running (by default rola looks once, quietly, at `http://127.0.0.1:8820` on startup; set `deadwax_url` in `settings.conf` for another address, or `"off"` to never look), rola goes further:
+
+- **Every scored album, not just the bundle's 19.5k**: rows outside the bundle are looked up in the background in small batches (scores of thin, 1–2 critic records show as `~+1.2σ`).
+- **Richer, scrollable cards**: the critics' panel with each outlet's score, the exact lists and prizes, crowd vs critics (fans, MusicBrainz users, Wikipedia reach), standout tracks, similar-era peers, and `o` to open the album in deadwax's web UI. On an artist, `i` shows the career: studio albums, peak, debut vs latest, a career curve and the scored discography.
+- **Live lenses** under *Acclaim · deadwax*: hidden records, crowd over critics, Pitchfork vs the field, debut masterpieces.
+
+Only the artist/title pairs of albums on screen (or the one you inspect) are sent, never your library or history, and the personal lenses stay local. Without a server, rola behaves exactly as before: no errors, no extra lenses, no extra settings. When a server was found, its toggles appear in `,` under *Deadwax live*.
 
 ## Beyond the API
 

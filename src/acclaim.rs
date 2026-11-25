@@ -12,6 +12,10 @@
 //! Two jobs: (1) put a score on any album row rola can match by artist + title (`of`), and
 //! (2) build the Acclaim lenses (`lens`), several of them personal: they look at what you already
 //! own to find acclaimed records you haven't heard, in the genres you actually listen to.
+//!
+//! When a deadwax server is reachable (`deadwax.rs`), `of` also finds the other ~45k scored albums
+//! (including thin, 1–2 critic records, shown with a `~`) once the background lookup answers.
+//! Without one, everything here works from the bundle alone.
 use crate::model::*;
 use std::{
     cell::RefCell,
@@ -24,7 +28,7 @@ use std::{
 
 const DATA: &str = include_str!("../data/acclaim.tsv");
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct Rec {
     pub artist: String,
     pub title: String,
@@ -38,6 +42,8 @@ pub struct Rec {
     pub split: f32,
     pub lists: u8,
     pub prize: char,
+    /// MusicBrainz release-group id: set on live records only (the bundle doesn't carry it).
+    pub rgid: String,
 }
 
 struct Db {
@@ -79,6 +85,7 @@ fn db() -> &'static Db {
                 split: num(9),
                 lists: f[10].parse().unwrap_or(0),
                 prize: f[11].chars().next().unwrap_or('-'),
+                rgid: String::new(),
             });
         }
         let mut by_key: HashMap<String, usize> = HashMap::new();
@@ -140,7 +147,8 @@ pub fn norm_artist(s: &str) -> String {
     alnum(t)
 }
 
-fn find(artist: &str, title: &str) -> Option<&'static Rec> {
+/// The bundled record for an album credited to `artist` (Spotify-style: "A, B" or "A · …").
+pub fn find(artist: &str, title: &str) -> Option<&'static Rec> {
     let d = db();
     let t = norm_title(title);
     let first = artist.split(" · ").next().unwrap_or(artist);
@@ -152,15 +160,56 @@ fn find(artist: &str, title: &str) -> Option<&'static Rec> {
 }
 
 thread_local! {
-    static MEMO: RefCell<HashMap<String, Option<&'static Rec>>> = RefCell::new(HashMap::new());
+    /// item id -> (bundled record, live cache key). Live answers are looked up each time, since
+    /// they arrive later and follow the live settings.
+    static MEMO: RefCell<HashMap<String, (Option<&'static Rec>, String)>> = RefCell::new(HashMap::new());
 }
 
-/// The acclaim record for an album row (any source), memoized by item id.
+fn memo<R>(it: &Item, f: impl FnOnce(Option<&'static Rec>, &str) -> R) -> R {
+    MEMO.with(|m| {
+        let mut m = m.borrow_mut();
+        let (b, k) = m.entry(it.id.clone()).or_insert_with(|| (find(&it.sub, &it.name), crate::deadwax::album_key(&it.sub, &it.name).0));
+        f(*b, k)
+    })
+}
+
+/// The bundled record for an album row only (no live lookup).
+pub fn bundled(it: &Item) -> Option<&'static Rec> {
+    if it.kind != Kind::Album {
+        return None;
+    }
+    memo(it, |b, _| b)
+}
+
+/// A live record for this normalized key, when live matching is on and it has answered.
+pub fn live(key: &str) -> Option<&'static Rec> {
+    crate::deadwax::with(|c| match c.resolve_on().then(|| c.look(key)) {
+        Some(crate::deadwax::Look::Hit(r)) => Some(r),
+        _ => None,
+    })
+    .flatten()
+}
+
+/// The acclaim record for an album row (any source): the bundle first, then live deadwax.
 pub fn of(it: &Item) -> Option<&'static Rec> {
     if it.kind != Kind::Album {
         return None;
     }
-    MEMO.with(|m| *m.borrow_mut().entry(it.id.clone()).or_insert_with(|| find(&it.sub, &it.name)))
+    memo(it, |b, k| b.or_else(|| live(k)))
+}
+
+/// Ask live deadwax (if on) about the album rows of a list that the bundle doesn't know.
+/// One deduplicated background batch; rows pick the answers up on a later frame.
+pub fn want_live(items: &[Item]) {
+    crate::deadwax::with(|c| {
+        if !c.resolve_on() {
+            return;
+        }
+        let miss: Vec<(String, String)> = items.iter().filter(|i| i.kind == Kind::Album && bundled(i).is_none()).map(|i| (i.sub.clone(), i.name.clone())).collect();
+        if !miss.is_empty() {
+            c.want(&miss);
+        }
+    });
 }
 
 // ---------- display ----------
@@ -178,17 +227,19 @@ pub fn pct_str(p: f32) -> String {
     if p >= 99.9 { format!("{p:.2}") } else if p >= 99.0 { format!("{p:.1}") } else { format!("{p:.0}") }
 }
 
-/// Right-aligned cell for a row: flags + score. ★ prize, ☰ on greatest-albums lists, ≠ critics split.
+/// Right-aligned cell for a row: flags + score. ★ prize, ☰ on greatest-albums lists, ≠ critics split,
+/// `~` before the score when only one or two critics rated it (live records; the bundle needs 3).
 pub fn cell(r: &Rec, show: Show) -> String {
     let mut flags = String::new();
     if r.prize == 'W' || r.prize == 'N' { flags.push('★') }
     if r.lists > 0 { flags.push('☰') }
     if r.split >= 0.9 { flags.push('≠') }
+    let thin = if r.n < 3 { "~" } else { "" };
     let score = match show {
         Show::Off => return String::new(),
-        Show::Z => format!("{:+.1}σ", r.z),
-        Show::Pct => format!("p{}", pct_str(r.pct)),
-        Show::Both => format!("{:+.1}σ p{}", r.z, pct_str(r.pct)),
+        Show::Z => format!("{thin}{:+.1}σ", r.z),
+        Show::Pct => format!("{thin}p{}", pct_str(r.pct)),
+        Show::Both => format!("{thin}{:+.1}σ p{}", r.z, pct_str(r.pct)),
     };
     if flags.is_empty() { score } else { format!("{flags} {score}") }
 }
@@ -218,7 +269,7 @@ pub fn card(r: &Rec) -> Vec<String> {
         format!(
             "critics      {}   {}",
             r.n,
-            if r.split >= 0.9 { "they disagree sharply: a split decision" } else if r.split >= 0.6 { "some disagreement" } else if r.n >= 4 { "a consensus" } else { "few critics so far" }
+            if r.n < 3 { "a thin record: treat the score as a hint" } else if r.split >= 0.9 { "they disagree sharply: a split decision" } else if r.split >= 0.6 { "some disagreement" } else if r.n >= 4 { "a consensus" } else { "few critics so far" }
         ),
     ];
     let mut honors = vec![];
@@ -494,5 +545,36 @@ mod tests {
     fn card_has_histogram() {
         let r = find("Talking Heads", "Remain in Light").unwrap();
         assert!(card(r).iter().any(|l| l.contains("you are here")));
+    }
+
+    fn rec(n: u8) -> Rec {
+        Rec { artist: "A".into(), title: "T".into(), year: 2001, genre: "Rock".into(), z: 1.234, lb: 0.5, pct: 88.0, gpct: 80.0, n, split: 0.1, lists: 0, prize: '-', rgid: "r".into() }
+    }
+
+    #[test]
+    fn thin_records_get_a_tilde() {
+        assert_eq!(cell(&rec(2), Show::Z), "~+1.2σ");
+        assert_eq!(cell(&rec(1), Show::Both), "~+1.2σ p88");
+        assert_eq!(cell(&rec(3), Show::Z), "+1.2σ");
+    }
+
+    #[test]
+    fn live_records_fill_in_bundle_misses_only_when_on() {
+        use crate::deadwax::{fake::Fake, Client, Config, DEFAULT_URL};
+        let thin = mk("al:thin", Kind::Album, "Deep Cuts", "Thin Band");
+        assert!(of(&thin).is_none(), "no client installed: bundle only");
+        let cfg = Config { url: DEFAULT_URL.into(), live: true, cards: true, resolve: true, lenses: true };
+        let c = Client::with_transport(cfg.clone(), Fake::new(&["lookup", "album_detail"]), true);
+        crate::deadwax::install(&c);
+        assert!(of(&thin).is_none(), "not connected yet");
+        c.start();
+        want_live(&[thin.clone(), mk("al:rl", Kind::Album, "Remain in Light", "Talking Heads")]);
+        let r = of(&thin).expect("live record");
+        assert_eq!((r.n, r.rgid.as_str()), (2, "rg-deepcuts"));
+        assert!(cell(r, Show::Z).starts_with('~'));
+        assert_eq!(sort_key(&thin), (r.lb * 100.0) as i32, "sorting uses the conservative lb");
+        c.set_config(Config { resolve: false, ..cfg });
+        assert!(of(&thin).is_none(), "turning live matching off hides live records again");
+        crate::deadwax::install(&Client::disabled());
     }
 }

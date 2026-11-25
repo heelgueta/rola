@@ -2,6 +2,21 @@
 
 All notable changes to rola. Newest first.
 
+## Unreleased
+
+### Added
+- **Live deadwax (optional)**: when a deadwax server answers at `deadwax_url` (default `http://127.0.0.1:8820`, probed once in the background at startup with a 150 ms timeout; `"off"` disables it), rola uses its `/api/v1/` API. Without one, nothing changes. New module `src/deadwax.rs`: background requests with short timeouts, in-memory caches, a circuit breaker with backoff, capability gating.
+  - **All ~64k scored albums**: album rows the bundle doesn't know are matched in deduplicated background batches (≤200); scores, flags and the acclaim sort pick them up. Records with only 1–2 critics show a `~` (`~+1.2σ`).
+  - **Scrollable cards** (`j`/`k`, `Ctrl-d`/`Ctrl-u`, `g`/`G`; close with `Esc`, `q` or `i`). Album cards open at once from the bundle and fill in from the server: critics' panel (score, z, retro), exact canon lists and prizes, crowd vs critics, standout tracks, similar-era neighbours, and `o` opens the album in deadwax's web UI.
+  - **Artist cards** (`i` on an artist): career summary, career curve and scored discography.
+  - **`i` on a track** opens its album's card (bundle-only too), highlighting the track; **`I`** inspects what is playing.
+  - **Live lenses** under *Acclaim · deadwax*: *Hidden records*, *Crowd over critics*, *Pitchfork vs the field*, *Debut masterpieces* (each shown only if the server offers it).
+  - Settings `deadwax_url`, `deadwax_live`, `deadwax_cards`, `deadwax_resolve`, `deadwax_lenses`; the *Deadwax live* section of `,` appears only when a server was found or a non-default URL is set.
+
+### Fixed
+- Settings with an inline comment (`accent`, `numbering`, `album_acclaim`, `hidden`) were read back wrong: anything but the default was lost on restart.
+- Tests no longer read the user's saved sort preferences.
+
 ## 0.1.0
 
 ### Added

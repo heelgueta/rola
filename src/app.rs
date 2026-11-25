@@ -10,14 +10,18 @@
 //!    everywhere that container is listed: as a column *and* as the preview of its parent;
 //!  * the cursor is remembered per container as the selected **item id** (not an index), so it
 //!    survives re-sorting and progressive loading.
+//!
+//! The card (`i` / `I`) is a scrollable overlay for an album or an artist. It opens at once with
+//! what the bundle knows and fills in from a live deadwax server, if there is one (`deadwax.rs`).
 use crate::{
     art::{Palette, Palettes},
+    deadwax,
     model::{mk, Item, Kind, Load, Source},
     settings::{self, Row, Settings},
     spotify::{Cmd, Event, PlayReq, Player},
 };
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use std::{cmp::Ordering, collections::HashMap, fs, path::PathBuf};
+use std::{cell::Cell, cmp::Ordering, collections::HashMap, fs, path::PathBuf};
 
 pub const SORTS: [&str; 7] = ["default", "name", "artist", "length", "released", "added", "acclaim"];
 
@@ -139,12 +143,39 @@ pub fn visible_root(all: &[Item], s: &Settings) -> Vec<Item> {
     out
 }
 
+/// What a card is about.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CardOf {
+    /// An album by its credited artist (as rola shows it) and title; `track` when opened from one.
+    Album { artist: String, title: String, track: Option<String> },
+    /// An artist's career (live deadwax only).
+    Artist { name: String },
+}
+
+/// The open card overlay.
+pub struct Card {
+    pub of: CardOf,
+    pub scroll: usize,
+    /// The largest useful scroll offset, written by the UI each time it draws the card
+    /// (it alone knows the wrapped height). `usize::MAX` until the first draw.
+    pub max: Cell<usize>,
+}
+
+impl Card {
+    pub fn new(of: CardOf) -> Card {
+        Card { of, scroll: 0, max: Cell::new(usize::MAX) }
+    }
+}
+
 // ---- persisted per-container sort preferences ----
 
 fn state_path() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/share/rola/state.json")
 }
 fn load_prefs() -> HashMap<String, (usize, bool)> {
+    if cfg!(test) {
+        return HashMap::new(); // tests must never read the user's real files either
+    }
     let v: serde_json::Value = fs::read_to_string(state_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
     v["sorts"]
         .as_object()
@@ -184,8 +215,12 @@ pub struct App {
     pub energy: f64,
     pub quit: bool,
     pub help: bool,
-    /// The acclaim card (`i`) for this album, when open.
-    pub card: Option<Item>,
+    /// The card (`i` / `I`), when open.
+    pub card: Option<Card>,
+    /// The optional live deadwax client (inert when there is no server; see deadwax.rs).
+    pub dw: deadwax::Client,
+    /// Tests: the deep link `o` would have opened (no browser is launched under `cargo test`).
+    pub opened: Option<String>,
     pub toast: Option<(String, f64)>,
     pub live: bool,
     palettes: Palettes,
@@ -217,10 +252,19 @@ impl App {
             want: None,
         };
         let live = player.is_some();
+        // Look for deadwax only in the real app: never in --demo or under cargo test.
+        let dw = if live && !cfg!(test) {
+            let c = deadwax::Client::new(settings.deadwax());
+            c.start();
+            c
+        } else {
+            deadwax::Client::disabled()
+        };
+        deadwax::install(&dw);
         let mut a = App {
             cols: vec![root], preview: vec![], preview_loading: false, preview_error: None, filtering: false, search: None,
             query: String::new(), settings, menu: None, now: None, playing: false, progress_ms: 0.0, volume: 70,
-            device: String::new(), art_url: String::new(), t: 0.0, energy: 0.15, quit: false, help: false, card: None, toast: None, live,
+            device: String::new(), art_url: String::new(), t: 0.0, energy: 0.15, quit: false, help: false, card: None, dw, opened: None, toast: None, live,
             palettes: Palettes::default(), prefs: load_prefs(), cursor: HashMap::new(), hold_until: 0.0, logged_id: None,
             history: vec![], queue: vec![], qi: 0, pending_g: false, reload_acc: 0.0, src, player,
         };
@@ -231,6 +275,20 @@ impl App {
 
     pub fn active(&self) -> &Column {
         self.cols.last().unwrap()
+    }
+
+    /// Swap in another deadwax client (tests use a scripted one).
+    #[cfg(test)]
+    pub fn set_deadwax(&mut self, c: deadwax::Client) {
+        c.set_config(self.settings.deadwax());
+        deadwax::install(&c);
+        self.dw = c;
+        self.refresh_preview();
+    }
+
+    /// The settings menu rows, with the *Deadwax live* section only when it applies.
+    pub fn menu_rows(&self) -> Vec<Row> {
+        settings::rows(self.settings.show_deadwax(self.dw.ever_up()))
     }
     fn active_mut(&mut self) -> &mut Column {
         self.cols.last_mut().unwrap()
@@ -261,6 +319,16 @@ impl App {
         if !self.settings.external && (it.id.starts_with("chart:") || it.id == "sec:charts") {
             return Load::Failed("external sources are turned off (press , to change)".into());
         }
+        // live deadwax lenses: source-independent, so they are handled here
+        if it.id == "sec:acclaim" {
+            if let Load::Ready(mut v) = self.src.children(it) {
+                v.extend(self.dw.lens_items());
+                return Load::Ready(v);
+            }
+        }
+        if it.id.starts_with("acc:live:") {
+            return self.dw.preset(&it.id);
+        }
         if !self.live {
             match it.id.as_str() {
                 "sec:queue" => return Load::Ready(self.queue.get(self.qi..).map(|q| q.to_vec()).unwrap_or_default()),
@@ -277,6 +345,7 @@ impl App {
 
     fn build_column(&self, item: Item) -> Column {
         let (items, loading, error) = split(self.children_of(&item));
+        crate::acclaim::want_live(&items);
         let (sort, rev) = self.prefs.get(&item.id).copied().unwrap_or((0, false));
         let want = self.cursor.get(&item.id).cloned();
         let mut c = Column { item, items, sel: 0, filter: String::new(), loading, error, sort, rev, want };
@@ -290,6 +359,7 @@ impl App {
             Some(it) if it.is_container() => split(self.children_of(it)),
             _ => (vec![], false, None),
         };
+        crate::acclaim::want_live(&p);
         if let Some(it) = &sel {
             let (sort, rev) = self.prefs.get(&it.id).copied().unwrap_or((0, false));
             let idx = order(&p, (0..p.len()).collect(), sort, rev);
@@ -305,6 +375,7 @@ impl App {
         for i in 0..self.cols.len() {
             if self.cols[i].loading || self.cols[i].want.is_some() {
                 let (items, loading, error) = split(self.children_of(&self.cols[i].item.clone()));
+                crate::acclaim::want_live(&items);
                 let c = &mut self.cols[i];
                 let keep = c.selected().map(|s| s.id.clone());
                 c.items = items;
@@ -436,6 +507,7 @@ impl App {
         if self.cols.len() == 1 {
             self.settle(1);
         }
+        self.dw.set_config(self.settings.deadwax());
         self.settings.save();
         self.refresh_preview();
     }
@@ -561,6 +633,7 @@ impl App {
 
     pub fn tick(&mut self, dt: f64) {
         self.t += dt;
+        self.dw.tick();
         if let Some((_, until)) = &self.toast {
             if self.t > *until {
                 self.toast = None;
@@ -616,7 +689,8 @@ impl App {
     }
 
     fn menu_key(&mut self, k: KeyEvent, cur: usize) {
-        let rows = settings::rows();
+        let rows = self.menu_rows();
+        let cur = cur.min(rows.len().saturating_sub(1));
         let step = |from: usize, d: isize| -> usize {
             let mut i = from as isize;
             loop {
@@ -645,13 +719,89 @@ impl App {
         }
     }
 
+    // ---------- cards ----------
+
+    /// `i` on a row / `I` on what is playing.
+    fn inspect(&mut self, it: &Item) {
+        match it.kind {
+            Kind::Album => self.inspect_album(&it.sub, &it.name, None),
+            Kind::Track => {
+                let (artist, album) = it.sub.split_once(" · ").unwrap_or((&it.sub, ""));
+                if album.is_empty() {
+                    return self.toast("no album to look up for this track");
+                }
+                let (artist, album) = (artist.to_string(), album.to_string());
+                self.inspect_album(&artist, &album, Some(it.name.clone()))
+            }
+            Kind::Artist if self.dw.cards_on() && self.dw.has("artists") => {
+                let _ = self.dw.artist(&it.name); // starts the fetch
+                self.card = Some(Card::new(CardOf::Artist { name: it.name.clone() }));
+            }
+            _ => self.toast("i shows the critics' card for an album or a track"),
+        }
+    }
+
+    fn inspect_album(&mut self, artist: &str, title: &str, track: Option<String>) {
+        let probe = mk(format!("xl:{artist}|{title}"), Kind::Album, title, artist);
+        let known = crate::acclaim::of(&probe).is_some();
+        let live = self.dw.cards_on();
+        let miss = matches!(self.dw.look(&deadwax::album_key(artist, title).0), deadwax::Look::Miss);
+        if !known && (!live || miss) {
+            let what = if track.is_some() { "this track's album" } else { "this album" };
+            return self.toast(format!("the critics' panel has no score for {what}"));
+        }
+        if live {
+            let _ = self.dw.album(artist, title); // hydrate in the background
+        }
+        self.card = Some(Card::new(CardOf::Album { artist: artist.to_string(), title: title.to_string(), track }));
+    }
+
+    /// The deadwax web page for the open album card, when the server offers one.
+    pub fn card_url(&self) -> Option<String> {
+        let CardOf::Album { artist, title, .. } = &self.card.as_ref()?.of else { return None };
+        match self.dw.album(artist, title) {
+            deadwax::Fetch::Ready(a) => self.dw.web_url(&a),
+            _ => None,
+        }
+    }
+
+    fn card_key(&mut self, k: KeyEvent) {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(card) = self.card.as_mut() else { return };
+        let max = card.max.get();
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('i') => self.card = None,
+            KeyCode::Char('d') if ctrl => card.scroll = (card.scroll + 10).min(max),
+            KeyCode::Char('u') if ctrl => card.scroll = card.scroll.saturating_sub(10),
+            KeyCode::PageDown => card.scroll = (card.scroll + 10).min(max),
+            KeyCode::PageUp => card.scroll = card.scroll.saturating_sub(10),
+            KeyCode::Char('j') | KeyCode::Down => card.scroll = (card.scroll + 1).min(max),
+            KeyCode::Char('k') | KeyCode::Up => card.scroll = card.scroll.saturating_sub(1),
+            KeyCode::Char('g') | KeyCode::Home => card.scroll = 0,
+            KeyCode::Char('G') | KeyCode::End => card.scroll = max.min(10_000),
+            KeyCode::Char('o') => {
+                // silent without a live page: nothing deadwax-specific appears offline
+                if let Some(url) = self.card_url() {
+                    if cfg!(test) {
+                        self.opened = Some(url);
+                    } else if open::that_detached(&url).is_err() {
+                        self.toast("couldn't open a browser for deadwax");
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn on_key(&mut self, k: KeyEvent) {
         if let Some(cur) = self.menu {
             return self.menu_key(k, cur);
         }
-        if self.help || self.card.is_some() {
+        if self.card.is_some() {
+            return self.card_key(k);
+        }
+        if self.help {
             self.help = false;
-            self.card = None;
             return;
         }
         if let Some(scope) = self.search.clone() {
@@ -727,6 +877,7 @@ impl App {
             KeyCode::Char('S') => self.cycle_sort(true),
             KeyCode::Char('R') => {
                 self.src.invalidate();
+                self.dw.refresh();
                 crate::acclaim::reroll();
                 for c in &mut self.cols {
                     c.loading = true;
@@ -745,9 +896,12 @@ impl App {
             KeyCode::Char('/') => self.filtering = true,
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('i') => match self.active().selected().cloned() {
-                Some(it) if crate::acclaim::of(&it).is_some() => self.card = Some(it),
-                Some(it) if it.kind == Kind::Album => self.toast("the critics' panel has no score for this album"),
-                _ => self.toast("i shows the critics' card for an album"),
+                Some(it) => self.inspect(&it),
+                None => self.toast("i shows the critics' card for an album or a track"),
+            },
+            KeyCode::Char('I') => match self.now.clone() {
+                Some(it) => self.inspect(&it),
+                None => self.toast("nothing playing to inspect"),
             },
             _ => {}
         }

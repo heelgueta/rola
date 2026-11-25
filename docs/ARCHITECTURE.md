@@ -13,6 +13,9 @@ A map for future-us. Read this first, then the module docs at the top of each fi
         Source trait (model.rs)
          ├─ spotify.rs  Live   : cached, background fetch threads, ListenBrainz, award/external resolvers
          └─ backend.rs  Mock   : demo data for `rola --demo` and tests
+
+        acclaim.rs (bundled data/acclaim.tsv) ──▶ deadwax.rs Client (optional live server, /api/v1/)
+                                                    background jobs · caches · circuit breaker
 ```
 
 rola is a **remote control**: it browses via the Spotify Web API and tells whichever Spotify
@@ -33,7 +36,8 @@ Connect device is active (e.g. Spotify.app) what to play. It never streams audio
 | `viz.rs` | the ribbon visualizer (+ parked plasma/spectrum), truecolor/256-color handling |
 | `history.rs` | local listening log (full history, most played) |
 | `awards.rs` | bundled award winners (`data/awards.tsv`), turned into `Item`s |
-| `acclaim.rs` | bundled critic scores (`data/acclaim.tsv`): matching albums by normalized artist+title, row cells, the card, the Acclaim lenses and the listener `Profile` |
+| `acclaim.rs` | bundled critic scores (`data/acclaim.tsv`): matching albums by normalized artist+title, row cells, the card's core block, the Acclaim lenses and the listener `Profile` |
+| `deadwax.rs` | optional live deadwax client: probe, batch resolve, album/artist detail, live lenses, settings gates, the thread-local handle, a scripted fake for tests |
 | `backend.rs` | the mock source |
 | `tools/gen_awards.py` | regenerates `data/awards.tsv` from Wikipedia |
 | `tools/export_acclaim.py` | exports `data/acclaim.tsv` from a deadwax database |
@@ -65,6 +69,62 @@ resolved to Spotify by search only when opened (`fetch` in spotify.rs) or played
 personal ones (`next`, `shelf`, `dig`) from `sec:albums`, top artists and local history through the
 normal cache, so they stay `Loading` until those are complete. Ranking is by `lb` (z minus one
 posterior sd). `dig` is seeded by the day plus a counter that `R` bumps (`acclaim::reroll`).
+
+## Live deadwax
+
+deadwax (the research project behind the bundle) can run as a server with a versioned API
+(`/api/v1/`, contract in deadwax's `docs/API.md`). `deadwax.rs` makes it an optional layer on top of
+the bundle. The bundle stays the source of truth offline and is never replaced, only extended.
+
+**Lifecycle.** `App::new` builds a `deadwax::Client` from the settings. In the real app (not
+`--demo`, not `cargo test`) it calls `start()`: one `GET {deadwax_url}/api/v1/meta` on a background
+thread, timeout 150 ms for loopback, 1.5 s for remote URLs. `schema_version` must be 1. On failure the
+client is `Down` for the session and every gate answers false: no requests, no toasts, no live
+lenses, no settings rows. `R` re-probes only when the user set a non-default URL (or the server had
+answered before). `deadwax_url = "off"` (or `""`) builds a client with no transport at all.
+
+**Gates.** `on()` = `deadwax_live` and connected; `resolve_on` / `cards_on` / `lenses_on` add their
+toggle and a server capability (`lookup`, `album_detail`, `presets`). Individual features also check
+capabilities: artist cards need `artists`, the live lenses `crowd` / `pitchfork` / `presets`, the
+`o` deep link `web_deeplink`. A public deadwax (`DEADWAX_PUBLIC=1`) lacks the restricted ones, so
+those features quietly disappear.
+
+**Never on the UI thread.** The UI only reads `Shared` (behind a mutex). Every request is a job on
+its own thread (`spawn`; tests run jobs inline with `sync`). Album detail, artist detail and presets
+are `Fetch::{Pending, Ready, Missing, Failed}` entries filled by those jobs; the card redraws each
+frame, so it hydrates by itself.
+
+**64k rows.** `acclaim::of(item)` checks the bundle (memoized per item id) and then, if
+`resolve_on`, the live record cache by normalized `artist|title` key. Live records are leaked to
+`&'static Rec` once per album, so they plug into everything that takes bundle records (rows, sort,
+card core, `Profile`). `App` calls `acclaim::want_live(items)` whenever a column or preview gets
+items: bundle misses are queued (deduplicated), and one resolver drains the queue in POSTs of ≤ 200
+normalized pairs (Spotify's `A, B` credits send `A, B` and `A`). Hits and misses are cached;
+transport failures leave keys unknown so they are retried after recovery.
+
+**Circuit breaker.** Three consecutive transport failures (or 5xx/429) while connected set `Down`
+with a retry time; `App::tick` calls `Client::tick`, which half-opens with one probe after the
+backoff (30 s, doubling to 5 min).
+
+**Thread-local handle.** `acclaim::of` runs inside sorting (`Column::view`) and drawing, with no
+`App` at hand, so the client is also installed in a thread-local (`deadwax::install` / `with`).
+Production has one UI thread; each test thread installs its own client (or none), which keeps
+tests isolated and offline.
+
+**Cards.** `App.card: Option<Card>` is an album (`artist`, `title`, optional `track`) or an artist.
+`i` on an album/track opens at once if the bundle knows the album, or if live cards are on (then
+with a placeholder until the server answers); `I` does the same for `App.now`. `ui::card` builds the
+lines each frame, writes the maximum useful scroll into `Card.max` (a `Cell`, the one place the UI
+writes state) and the key handler clamps to it. `o` opens `{deadwax_url}/#crate?open=<rgid>`.
+
+**Privacy.** Only normalized artist/title pairs of albums on screen, or the album/artist being
+inspected, are sent. The personal lenses (*Next up*, *Missing from your shelf*, *Crate dig*) and
+everything about the library and history stay local.
+
+**Settings.** `deadwax_url`, `deadwax_live`, `deadwax_cards`, `deadwax_resolve`,
+`deadwax_lenses`. `settings::rows(show)` includes the *Deadwax live* section only when
+`Settings::show_deadwax(client.ever_up())` holds (a server answered, or the URL isn't the default).
+Changing a toggle calls `Client::set_config`; the URL is fixed for the session.
 
 ## Consistency rules (sorting and cursor)
 
@@ -102,9 +162,13 @@ truecolor (Apple Terminal) every color is mapped to the nearest xterm-256 entry 
 ## Testing
 
 * `cargo test` runs headless: render tests via ratatui's `TestBackend`, sort/cursor/settings
-  logic, and the palette extractor. No network.
+  logic, the palette extractor, and the live-deadwax features against `deadwax::fake::Fake` (a
+  scripted server; offline fallback, batching, breaker, gating, cards, lenses). No network, and no
+  reads or writes of the user's settings, prefs or cache.
 * `cargo test -- --ignored --nocapture` runs the live tests against your real account (read-only
   except `live_bodyless_put`, which sets volume to its current value). They need a saved login.
+  `live_deadwax` and `live_cards_render` need a deadwax server instead (`DEADWAX_URL`, default
+  `http://127.0.0.1:8820`): end-to-end lookup, bundle/live agreement, card hydration and rendering.
 
 ## Recipes
 
